@@ -1,0 +1,27 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Generated RepoMap output
+repository_map.json
+repository_map.html
+repository_map.svg
+workflow_traces.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
