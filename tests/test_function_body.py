@@ -721,7 +721,7 @@ def test_method_patterns_and_schema(tmp_path):
 
     document = {"schema_version": SCHEMA_VERSION, "files": results}
     encoded = json.dumps(document)
-    assert json.loads(encoded)["schema_version"] == "1.1.0"
+    assert json.loads(encoded)["schema_version"] == "1.2.0"
     _validator().validate(document)
 
 

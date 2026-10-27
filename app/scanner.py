@@ -5,12 +5,15 @@ from collections import Counter, defaultdict
 from pathlib import Path
 import builtins
 
+from .inference import analyze_class, infer_function, infer_module
+
 BUILTIN_NAMES = set(dir(builtins))
 
 IGNORED_DIRS = {".git", ".venv", "__pycache__", "node_modules"}
 
-# Shape, stable ids, and call classifications: schema/repository_map.schema.json.
-SCHEMA_VERSION = "1.1.0"
+# Shape, stable ids, call classifications, and inferred types:
+# schema/repository_map.schema.json.
+SCHEMA_VERSION = "1.2.0"
 SCHEMA_FILE = (
     Path(__file__).resolve().parent.parent / "schema" / "repository_map.schema.json"
 )
@@ -1130,13 +1133,46 @@ def _local_definitions(fn_node):
                 "name": node.name,
                 "line": node.lineno,
                 "methods": _class_methods(node),
+                "fields": [],
             })
     return definitions
 
 
-def _record_function(analysis, node, parent_key=None, class_name=None):
+def _attach_class_fields(definitions, node, fields):
+    for local in definitions:
+        if (
+            local.get("kind") == "class"
+            and local["name"] == node.name
+            and local["line"] == node.lineno
+        ):
+            local["fields"] = fields
+            return
+
+
+def _record_function(
+    analysis,
+    node,
+    parent_key=None,
+    class_name=None,
+    *,
+    is_method=False,
+    class_line=None,
+    parent_inf=None,
+    prepared=None,
+):
+    if prepared is None:
+        types, inf = infer_function(
+            node,
+            parent_inf,
+            class_name=class_name,
+            class_line=class_line,
+            is_method=is_method,
+        )
+    else:
+        types, inf = prepared
+
     calls, local_imports = _collect_calls_and_imports(node)
-    analysis["function_details"].append({
+    detail = {
         "name": node.name,
         "line": node.lineno,
         "signature": _function_signature(node),
@@ -1144,19 +1180,31 @@ def _record_function(analysis, node, parent_key=None, class_name=None):
         "calls": calls,
         "local_imports": local_imports,
         "local_definitions": _local_definitions(node),
+        "types": types,
         "parent_key": list(parent_key) if parent_key else None,
         "class_name": class_name,
-    })
-    for detail in local_imports:
-        analysis["imports"].extend(_imported_module_strings(detail))
+    }
+    analysis["function_details"].append(detail)
+    for imported in local_imports:
+        analysis["imports"].extend(_imported_module_strings(imported))
 
     child_key = (node.name, node.lineno)
     for child in _iter_block_level(node.body):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if _is_overload(child):
                 continue
-            _record_function(analysis, child, child_key, class_name)
+            _record_function(
+                analysis,
+                child,
+                child_key,
+                class_name,
+                is_method=False,
+                parent_inf=inf,
+                prepared=inf.nested.get((child.name, child.lineno)),
+            )
         elif isinstance(child, ast.ClassDef):
+            fields, methods = analyze_class(child, inf)
+            _attach_class_fields(detail["local_definitions"], child, fields)
             for method in child.body:
                 if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if _is_overload(method):
@@ -1166,6 +1214,10 @@ def _record_function(analysis, node, parent_key=None, class_name=None):
                         method,
                         child_key,
                         child.name,
+                        is_method=True,
+                        class_line=child.lineno,
+                        parent_inf=inf,
+                        prepared=methods.get((method.name, method.lineno)),
                     )
 
 
@@ -1219,6 +1271,7 @@ def analyze_file(file_path):
                 "line": node.lineno,
                 "bases": _base_names(node),
                 "methods": _class_methods(node),
+                "fields": [],
             })
 
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1240,18 +1293,38 @@ def analyze_file(file_path):
                 binding["name"] = name
                 analysis["bindings"].append(binding)
 
+    module_inf = infer_module(tree)
     for node in _iter_block_level(tree.body):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if _is_overload(node):
                 continue
-            _record_function(analysis, node)
+            _record_function(
+                analysis,
+                node,
+                is_method=False,
+                parent_inf=module_inf,
+            )
         elif isinstance(node, ast.ClassDef):
+            fields, methods = analyze_class(node, module_inf)
+            for cls in analysis["classes"]:
+                if cls["name"] == node.name and cls["line"] == node.lineno:
+                    cls["fields"] = fields
+                    break
             for child in node.body:
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if _is_overload(child):
                         continue
-                    _record_function(analysis, child, class_name=node.name)
+                    _record_function(
+                        analysis,
+                        child,
+                        class_name=node.name,
+                        is_method=True,
+                        class_line=node.lineno,
+                        parent_inf=module_inf,
+                        prepared=methods.get((child.name, child.lineno)),
+                    )
 
+    analysis["types"] = module_inf.export_bindings()
     analysis["imports"] = list(dict.fromkeys(analysis["imports"]))
     return analysis
 
@@ -1963,11 +2036,141 @@ def _classify_unresolved_call(call_name, hit, result, detail, index):
     return "unclassified"
 
 
+_INFERRED_KINDS = {
+    "primitive",
+    "none",
+    "any",
+    "unknown",
+    "never",
+    "list",
+    "dict",
+    "set",
+    "tuple",
+    "optional",
+    "union",
+    "class",
+    "generic",
+    "callable",
+    "typevar",
+    "typevartuple",
+    "paramspec",
+}
+
+
+def _class_indexes(result):
+    by_line = {}
+    by_name = defaultdict(list)
+
+    def add(name, line, class_id):
+        by_line[(name, line)] = class_id
+        by_name[name].append(class_id)
+
+    for cls in result.get("classes") or []:
+        add(cls["name"], cls["line"], cls["id"])
+    for detail in result.get("function_details") or []:
+        for local in detail.get("local_definitions") or []:
+            if local.get("kind") == "class":
+                add(local["name"], local["line"], local["id"])
+    return by_line, by_name
+
+
+def _become_unknown(typ):
+    typ.clear()
+    typ["kind"] = "unknown"
+
+
+def _link_inferred(typ, by_line, by_name, class_targets):
+    """Return True when this type itself was a constructor guess that did not resolve."""
+    if not isinstance(typ, dict) or typ.get("kind") not in _INFERRED_KINDS:
+        return False
+    downgraded = False
+    for key in ("element", "key", "value", "returns"):
+        child = typ.get(key)
+        if isinstance(child, dict):
+            _link_inferred(child, by_line, by_name, class_targets)
+    for key in ("elements", "options", "args", "parameters"):
+        children = typ.get(key)
+        if isinstance(children, list):
+            for child in children:
+                if isinstance(child, dict):
+                    _link_inferred(child, by_line, by_name, class_targets)
+
+    if typ.get("kind") != "class":
+        typ.pop("_def_line", None)
+        typ.pop("_tentative", None)
+        return False
+
+    line = typ.pop("_def_line", None)
+    tentative = typ.pop("_tentative", None)
+    if typ.get("id"):
+        return False
+    name = typ.get("name")
+    if line is not None and (name, line) in by_line:
+        typ["id"] = by_line[(name, line)]
+        return False
+    local = by_name.get(name) or []
+    if len(local) == 1:
+        typ["id"] = local[0]
+        return False
+    found = class_targets(name) if name else []
+    if len(found) == 1:
+        typ["id"] = found[0]["id"]
+        return False
+    if tentative and not found:
+        _become_unknown(typ)
+        downgraded = True
+    return downgraded
+
+
+def _link_owner(owner, by_line, by_name, class_targets):
+    if not isinstance(owner, dict):
+        return
+    typ = owner.get("type")
+    if _link_inferred(typ, by_line, by_name, class_targets):
+        owner["source"] = None
+
+
+def link_type_ids(results):
+    """Fill class ids on inferred types, and drop imported calls that are not classes."""
+    index = ResolutionIndex(results)
+    for result in results:
+        by_line, by_name = _class_indexes(result)
+        module = _module_from_file(result["file"])
+        cache = {}
+
+        def class_targets(name):
+            if name not in cache:
+                hit = index.lookup(module, name)
+                cache[name] = [
+                    target
+                    for target in hit.targets
+                    if str(target.get("id", "")).startswith("class:")
+                ]
+            return cache[name]
+
+        for binding in result.get("types") or []:
+            _link_owner(binding, by_line, by_name, class_targets)
+        for cls in result.get("classes") or []:
+            for field in cls.get("fields") or []:
+                _link_owner(field, by_line, by_name, class_targets)
+        for detail in result.get("function_details") or []:
+            types = detail.get("types") or {}
+            for group in ("parameters", "locals", "attributes"):
+                for binding in types.get(group) or []:
+                    _link_owner(binding, by_line, by_name, class_targets)
+            _link_owner(types.get("returns"), by_line, by_name, class_targets)
+            for local in detail.get("local_definitions") or []:
+                for field in local.get("fields") or []:
+                    _link_owner(field, by_line, by_name, class_targets)
+    return results
+
+
 def build_repository_map(repo_path):
     results = analyze_repository(repo_path)
     results = assign_ids(results, repo_path)
     results = resolve_dependencies(results, repo_path)
-    return resolve_function_calls(results)
+    results = resolve_function_calls(results)
+    return link_type_ids(results)
 
 
 def known_definition_ids(results):

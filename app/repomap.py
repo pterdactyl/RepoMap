@@ -9,6 +9,7 @@ from .scanner import (
     analyze_repository,
     assign_ids,
     export_results,
+    link_type_ids,
     print_run_summary,
     resolve_dependencies,
     resolve_function_calls,
@@ -58,6 +59,7 @@ def _emit_map(repo_path, output_dir, source):
     results = assign_ids(results, repo_path)
     results = resolve_dependencies(results, repo_path)
     results = resolve_function_calls(results)
+    results = link_type_ids(results)
     print_run_summary(results)
 
     output_dir = Path(output_dir)
