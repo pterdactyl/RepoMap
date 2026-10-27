@@ -12,7 +12,8 @@ BUILTIN_NAMES = set(dir(builtins))
 IGNORED_DIRS = {".git", ".venv", "__pycache__", "node_modules"}
 
 # Shape, stable ids, call classifications, inferred types, and entry points:
-# schema/repository_map.schema.json.
+# schema/repository_map.schema.json. 1.3.0 is the frozen RepoMap v1 contract
+# for Translate. Limitations are recorded in schema/v1-contract.md.
 SCHEMA_VERSION = "1.3.0"
 _ENTRY_REASONS = ("main", "all", "reexport", "public")
 _TEST_DIR_NAMES = {"test", "tests", "testing"}
@@ -149,7 +150,7 @@ def _iter_block_level(nodes):
         if isinstance(node, ast.If):
             yield from _iter_block_level(node.body)
             yield from _iter_block_level(node.orelse)
-        elif isinstance(node, ast.Try):
+        elif isinstance(node, ast.Try) or _is_node(node, "TryStar"):
             yield from _iter_block_level(node.body)
             for handler in node.handlers:
                 yield from _iter_block_level(handler.body)
@@ -201,17 +202,27 @@ def _class_methods(node):
 
 
 def _simple_assignment(node):
-    if isinstance(node, ast.Assign) and len(node.targets) == 1:
-        target = node.targets[0]
-        if isinstance(target, ast.Name):
-            return target.id, node.value
+    """Return the names bound by a module-level assignment, and the value.
+
+    A chain such as ``ib = attr = attrib`` binds every name. A target that
+    is not a bare name, including unpacking, is not a binding.
+    """
+    if isinstance(node, ast.Assign):
+        names = []
+        for target in node.targets:
+            if not isinstance(target, ast.Name):
+                return [], None
+            names.append(target.id)
+        if not names:
+            return [], None
+        return names, node.value
     if (
         isinstance(node, ast.AnnAssign)
         and isinstance(node.target, ast.Name)
         and node.value is not None
     ):
-        return node.target.id, node.value
-    return None, None
+        return [node.target.id], node.value
+    return [], None
 
 
 def _binding_from_value(value):
@@ -1184,7 +1195,7 @@ def _record_function(
         "local_definitions": _local_definitions(node),
         "types": types,
         "parent_key": list(parent_key) if parent_key else None,
-        "class_name": class_name,
+        "class_name": class_name if is_method else None,
     }
     analysis["function_details"].append(detail)
     for imported in local_imports:
@@ -1537,8 +1548,8 @@ def analyze_file(file_path):
             })
 
         else:
-            name, value = _simple_assignment(node)
-            if name:
+            names, value = _simple_assignment(node)
+            for name in names:
                 binding = _binding_from_value(value)
                 binding["name"] = name
                 analysis["bindings"].append(binding)
@@ -1588,10 +1599,19 @@ def analyze_repository(repo_path):
     for file in repo.rglob("*.py"):
         if any(part in IGNORED_DIRS for part in file.parts):
             continue
+        try:
+            file.resolve().relative_to(repo)
+        except ValueError:
+            print(f"Skipping {file}: path is outside the repository")
+            continue
 
         try:
             results.append(analyze_file(file))
-        except (SyntaxError, UnicodeDecodeError) as error:
+        except (SyntaxError, UnicodeDecodeError, RecursionError) as error:
+            print(f"Skipping {file}: {error}")
+        except ValueError as error:
+            if "null byte" not in str(error).lower():
+                raise
             print(f"Skipping {file}: {error}")
 
     return results
@@ -1639,6 +1659,21 @@ def assign_ids(results, repo_path):
                 )
                 if method_counts[method["name"]] > 1:
                     method["id"] += f":{method['line']}"
+
+        shared_methods = defaultdict(list)
+        for cls in result["classes"]:
+            for method in cls["methods"]:
+                shared_methods[method["id"]].append(method)
+        for methods in shared_methods.values():
+            if len(methods) < 2:
+                continue
+            for method in methods:
+                suffix = f":{method['line']}"
+                if not method["id"].endswith(suffix):
+                    method["id"] += suffix
+
+        for cls in result["classes"]:
+            for method in cls["methods"]:
                 node_ids[(method["name"], method["line"])] = method["id"]
 
         for function in result["functions"]:

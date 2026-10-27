@@ -104,8 +104,9 @@ def build_parser():
             "Generate an interactive map of a GitHub repository or a local directory."
         ),
         epilog=(
-            f"repository_map.json is written as schema version {SCHEMA_VERSION}. "
-            "See schema/repository_map.schema.json."
+            f"repository_map.json is written as schema version {SCHEMA_VERSION}, "
+            "the frozen RepoMap v1 contract. "
+            "See schema/repository_map.schema.json and schema/v1-contract.md."
         ),
     )
     parser.add_argument(

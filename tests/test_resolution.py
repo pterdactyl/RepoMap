@@ -444,3 +444,37 @@ def test_self_call_resolves_inherited_same_file_method(tmp_path):
     assert _target_ids(by_class["Overrider"]["self.helper()"]) == [
         "method:mod.py:Overrider:helper"
     ]
+
+
+def test_chained_alias_resolves_to_the_function(tmp_path):
+    _write_repo(tmp_path, {
+        "pkg.py": """
+            def attrib():
+                return 1
+
+            ib = attr = attrib
+
+            def use():
+                return ib()
+        """,
+        "caller.py": """
+            import pkg
+
+            def run():
+                return pkg.ib()
+        """,
+    })
+
+    results = build_repository_map(tmp_path)
+    use = _call_map(_function(results, "pkg.py", "use"))
+    run = _call_map(_function(results, "caller.py", "run"))
+    assert use["ib()"]["classification"] == "resolved"
+    assert _target_ids(use["ib()"]) == ["function:pkg.py:attrib"]
+    assert run["pkg.ib()"]["classification"] == "resolved"
+    assert _target_ids(run["pkg.ib()"]) == ["function:pkg.py:attrib"]
+    bindings = {
+        binding["name"]: binding
+        for binding in _by_file(results)["pkg.py"]["bindings"]
+    }
+    assert bindings["ib"] == {"name": "ib", "kind": "alias", "source": "attrib"}
+    assert bindings["attr"] == {"name": "attr", "kind": "alias", "source": "attrib"}

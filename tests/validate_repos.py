@@ -1,62 +1,69 @@
 #!/usr/bin/env python3
+"""Validate RepoMap's v1 contract against one or more Python repositories.
+
+Checks the JSON Schema, then the links it cannot express: dependencies,
+function calls, bodies, types, and entry points. Parse failures are omitted
+files, not contract errors. A repository that produces a schema violation,
+a dangling id, or an inconsistent call fails the process.
+"""
+
 import json
 import sys
-from collections import Counter
 from pathlib import Path
 
-from app.scanner import (
-    build_repository_map,
-    known_definition_ids,
-    print_run_summary,
-)
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.contract import validate_repository_map
+from app.scanner import build_repository_map
 
 
-def validate(results):
-    ids = known_definition_ids(results)
-    invalid = []
-    classifications = Counter()
-    resolved_with_empty = 0
-    unresolved_with_targets = 0
-
-    for result in results:
-        for detail in result.get("function_details", []):
-            for call in detail.get("resolved_calls", []):
-                classifications[call["classification"]] += 1
-                targets = call.get("targets") or []
-                if call["unresolved"] and targets:
-                    unresolved_with_targets += 1
-                if not call["unresolved"] and not targets:
-                    resolved_with_empty += 1
-                for target in targets:
-                    if target.get("id") not in ids:
-                        invalid.append((result["file"], call["name"], target))
-
-    return {
-        "classifications": dict(classifications),
-        "invalid_targets": invalid,
-        "resolved_with_empty": resolved_with_empty,
-        "unresolved_with_targets": unresolved_with_targets,
-        "total_calls": sum(classifications.values()),
-    }
-
-
-def main(repo_path):
+def check_repository(repo_path):
     repo_path = Path(repo_path)
-    print(f"\n===== Validating {repo_path.name} =====")
     results = build_repository_map(repo_path)
-    print_run_summary(results)
-    report = validate(results)
-    print("\nIntegrity:")
-    print(json.dumps({
-        k: v for k, v in report.items() if k != "invalid_targets"
-    }, indent=2))
-    print(f"Invalid targets: {len(report['invalid_targets'])}")
-    for item in report["invalid_targets"][:10]:
-        print(" ", item)
+    report = validate_repository_map(results, repo_path=repo_path)
+    return results, report
 
-    if report["invalid_targets"] or report["resolved_with_empty"] or report["unresolved_with_targets"]:
-        sys.exit(1)
+
+def _print_report(repo_path, report):
+    print(f"\n===== {Path(repo_path).resolve().name or Path(repo_path).resolve()} =====")
+    summary = dict(report.summary)
+    omitted = summary.pop("omitted_files", [])
+    print(json.dumps(summary, indent=2))
+    print(f"Omitted files: {len(omitted)}")
+    for relative in omitted[:10]:
+        print(f"  omitted {relative}")
+    print(f"Contract errors: {len(report.errors) + report.hidden_errors}")
+    for message in report.errors:
+        print(f"  {message}")
+    if report.hidden_errors:
+        print(f"  ... {report.hidden_errors} more")
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        print(
+            "usage: python tests/validate_repos.py REPO [REPO ...]",
+            file=sys.stderr,
+        )
+        return 2
+
+    failed = False
+    for repo in argv:
+        try:
+            _results, report = check_repository(repo)
+        except (OSError, ValueError) as error:
+            print(f"\n===== {Path(repo).name} =====")
+            print(f"  scan failed: {error}")
+            failed = True
+            continue
+        _print_report(repo, report)
+        if not report.ok:
+            failed = True
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    sys.exit(main())
