@@ -1,6 +1,7 @@
-import json
 from pathlib import Path
 from graphviz import Digraph
+
+from .scanner import load_repository_map
 
 
 def visualize_repository(
@@ -10,8 +11,7 @@ def visualize_repository(
     input_file = Path(input_file)
     output_file = Path(output_file)
 
-    with input_file.open("r") as file:
-        results = json.load(file)
+    results = load_repository_map(input_file)
 
     graph = Digraph("RepoMap", engine="dot", format="svg")
     graph.attr(

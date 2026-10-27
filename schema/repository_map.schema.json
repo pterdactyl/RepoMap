@@ -1,0 +1,580 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "repository_map.schema.json",
+  "title": "RepoMap repository_map.json",
+  "description": "Static map of a Python repository. New exports are versioned documents (schema_version 1.0.0). Maps written before that version are a JSON array of the same file records and remain valid for readers.\n\nPaths are repository-relative and use forward slashes. The src/ directory prefix is kept in paths and ids; it is stripped only when deriving a Python module name for import resolution.\n\nDirectories named .git, .venv, __pycache__, and node_modules are skipped. Files that fail to parse are omitted.\n\nStable ids identify a file, class, method, or function inside one map. They stay the same across runs when the relative path and definition name stay the same. A line number is appended only when a file has more than one top-level definition with that name, and is always included for definitions nested inside a function. Those line-qualified ids change if the definition moves to a different line.\n\nId grammar:\n- file:{path}\n- class:{path}:{name} or class:{path}:{name}:{line}\n- method:{path}:{class}:{name} or method:{path}:{class}:{name}:{line}\n- function:{path}:{name} or function:{path}:{name}:{line}\n\nNested classes and functions always use the line-qualified form. Nested methods use method:{path}:{class}:{name}:{line}.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/versionedMap"
+    },
+    {
+      "$ref": "#/$defs/legacyMap"
+    }
+  ],
+  "$defs": {
+    "versionedMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "files"],
+      "properties": {
+        "schema_version": {
+          "const": "1.0.0",
+          "description": "Document format version. 1.0.0 is the first versioned repository_map.json."
+        },
+        "source": {
+          "$ref": "#/$defs/source",
+          "description": "Where the map was scanned from. Omitted when the caller does not supply it."
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/fileRecord"
+          },
+          "description": "One record per parsed Python file."
+        }
+      }
+    },
+    "legacyMap": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/fileRecord"
+      },
+      "description": "Unversioned repository_map.json: a JSON array of file records. Readers still accept this form. New exports use versionedMap."
+    },
+    "source": {
+      "description": "Scan input. local is a directory analyzed in place. git is a remote that was cloned, including GitHub URLs.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "path"],
+          "properties": {
+            "kind": {
+              "const": "local"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Absolute path of the directory that was scanned."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "url"],
+          "properties": {
+            "kind": {
+              "const": "git"
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Git remote URL passed to the clone, unchanged."
+            }
+          }
+        }
+      ]
+    },
+    "stableId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(file|class|method|function):.+$",
+      "description": "Stable id. Prefix is file, class, method, or function. The rest is the repository-relative path plus the definition name, and a line number when the grammar requires one.",
+      "examples": [
+        "file:pkg/client.py",
+        "function:pkg/client.py:run",
+        "function:pkg/compat.py:encode:8",
+        "class:pkg/models.py:User",
+        "method:pkg/models.py:User:save",
+        "function:pkg/client.py:inner:4"
+      ]
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Repository-relative path using forward slashes."
+    },
+    "fileRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "id",
+        "imports",
+        "import_details",
+        "classes",
+        "functions",
+        "bindings",
+        "function_details",
+        "dependencies"
+      ],
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/relativePath",
+          "description": "Path of this Python file relative to the repository root."
+        },
+        "id": {
+          "$ref": "#/$defs/stableId",
+          "description": "File id: file:{path}. Never includes a line number."
+        },
+        "imports": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          },
+          "description": "Module strings imported by this file, in source order, including imports nested in functions. Relative imports keep their leading dots. Duplicates are removed."
+        },
+        "import_details": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/importDetail"
+          },
+          "description": "Import statements at module scope, including imports inside if, try, for, while, with, and match. Imports inside functions are stored on the function instead."
+        },
+        "classes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/classDef"
+          },
+          "description": "Classes defined at module scope, including classes inside conditional blocks. Classes defined inside functions are listed on that function's local_definitions. Overload stubs are not classes."
+        },
+        "functions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/functionDef"
+          },
+          "description": "Functions defined at module scope, including functions inside conditional blocks. Nested functions are listed on the enclosing function. @overload stubs are omitted."
+        },
+        "bindings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/binding"
+          },
+          "description": "Simple module-level name assignments used to follow aliases, builtins, and values. Includes assignments inside conditional blocks."
+        },
+        "function_details": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/functionDetail"
+          },
+          "description": "Body-level detail for every scanned function and method, including functions and methods nested inside other functions."
+        },
+        "dependencies": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/relativePath"
+          },
+          "description": "Other files in this repository imported by this file, sorted by relative path. The file itself is not included. External and standard-library modules are omitted."
+        }
+      }
+    },
+    "importDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "module", "level", "alias", "names"],
+      "properties": {
+        "type": {
+          "enum": ["import", "from"],
+          "description": "import for `import x`. from for `from x import y`."
+        },
+        "module": {
+          "type": ["string", "null"],
+          "description": "Module named by the statement. Null for a bare relative import such as `from . import name`."
+        },
+        "level": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of leading dots on a relative import. 0 for an absolute import."
+        },
+        "alias": {
+          "type": ["string", "null"],
+          "description": "as-name for an `import module as alias` statement. Null for `from` imports; those aliases live on names."
+        },
+        "names": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/importedName"
+          },
+          "description": "Names bound by a from-import. Empty for a plain import."
+        }
+      }
+    },
+    "importedName": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "alias"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Imported name, or * for a star import."
+        },
+        "alias": {
+          "type": ["string", "null"],
+          "description": "as-name, or null when the imported name is bound as itself."
+        }
+      }
+    },
+    "classDef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "line", "bases", "methods", "id"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based line of the class statement."
+        },
+        "bases": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Base classes that have a dotted name. Bases that are calls or other expressions are omitted."
+        },
+        "methods": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/methodDef"
+          },
+          "description": "Methods defined directly on the class. Nested functions inside methods are not methods. @overload stubs are omitted."
+        },
+        "id": {
+          "$ref": "#/$defs/stableId",
+          "description": "class:{path}:{name}. When the file defines more than one top-level class with this name, the id ends with :{line}."
+        }
+      }
+    },
+    "methodDef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "line", "id"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "id": {
+          "$ref": "#/$defs/stableId",
+          "description": "method:{path}:{class}:{name}. When the class defines this method name more than once, the id ends with :{line}. Methods of a class nested inside a function always end with :{line}."
+        }
+      }
+    },
+    "functionDef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "line", "id"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "id": {
+          "$ref": "#/$defs/stableId",
+          "description": "function:{path}:{name}. When the file defines more than one top-level function with this name, the id ends with :{line}."
+        }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "source"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Name bound by the assignment."
+        },
+        "kind": {
+          "enum": ["builtin", "alias", "value"],
+          "description": "builtin when the value is a Python builtin name. alias when the value is another name. value for any other assigned expression."
+        },
+        "source": {
+          "type": ["string", "null"],
+          "description": "Builtin or alias name being bound. Null when kind is value."
+        }
+      }
+    },
+    "functionDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "line",
+        "calls",
+        "local_imports",
+        "local_definitions",
+        "class_name",
+        "id",
+        "parent_id",
+        "resolved_calls"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "calls": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^.+\\(\\)$"
+          },
+          "description": "Unique call expressions in this function body, sorted, each written as a dotted name plus (). Calls inside nested functions or classes are not included; those bodies have their own details."
+        },
+        "local_imports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/importDetail"
+          },
+          "description": "Imports that appear in this function body and not in a nested function or class."
+        },
+        "local_definitions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/localDefinition"
+          },
+          "description": "Functions and classes defined inside this function. Definitions nested another level down are recorded on the inner function."
+        },
+        "class_name": {
+          "type": ["string", "null"],
+          "description": "Class that defines this method. Null for a plain function."
+        },
+        "id": {
+          "$ref": "#/$defs/stableId",
+          "description": "Same id as the matching function, method, or local definition."
+        },
+        "parent_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/stableId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Id of the function that immediately encloses this definition. Null for module-level functions and for methods defined directly on a class."
+        },
+        "resolved_calls": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/resolvedCall"
+          },
+          "description": "One entry per calls item, in the same sorted order, with targets and a classification."
+        }
+      }
+    },
+    "localDefinition": {
+      "description": "A function or class defined inside another function. Its id always includes the line number.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "line", "id"],
+          "properties": {
+            "kind": {
+              "const": "function"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "line": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "id": {
+              "$ref": "#/$defs/stableId",
+              "description": "function:{path}:{name}:{line}."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "line", "id", "methods"],
+          "properties": {
+            "kind": {
+              "const": "class"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "line": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "id": {
+              "$ref": "#/$defs/stableId",
+              "description": "class:{path}:{name}:{line}."
+            },
+            "methods": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/methodDef"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "resolvedCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "targets", "ambiguous", "unresolved", "classification"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^.+\\(\\)$",
+          "description": "Call expression, identical to the matching item in calls."
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/callTarget"
+          },
+          "description": "In-repository definitions this call resolves to. Empty unless classification is resolved or ambiguous. Every target id refers to a definition in this map."
+        },
+        "ambiguous": {
+          "type": "boolean",
+          "description": "True when targets contains more than one definition."
+        },
+        "unresolved": {
+          "type": "boolean",
+          "description": "True when targets is empty."
+        },
+        "classification": {
+          "$ref": "#/$defs/callClassification"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "classification": {
+                "const": "resolved"
+              }
+            },
+            "required": ["classification"]
+          },
+          "then": {
+            "properties": {
+              "ambiguous": {
+                "const": false
+              },
+              "unresolved": {
+                "const": false
+              },
+              "targets": {
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "classification": {
+                "const": "ambiguous"
+              }
+            },
+            "required": ["classification"]
+          },
+          "then": {
+            "properties": {
+              "ambiguous": {
+                "const": true
+              },
+              "unresolved": {
+                "const": false
+              },
+              "targets": {
+                "minItems": 2
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "classification": {
+                "enum": [
+                  "python_builtin",
+                  "dynamic_or_instance",
+                  "external",
+                  "unresolved_internal",
+                  "unclassified"
+                ]
+              }
+            },
+            "required": ["classification"]
+          },
+          "then": {
+            "properties": {
+              "ambiguous": {
+                "const": false
+              },
+              "unresolved": {
+                "const": true
+              },
+              "targets": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "callTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "file"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/stableId",
+          "description": "Id of the targeted function, method, or class."
+        },
+        "file": {
+          "$ref": "#/$defs/relativePath",
+          "description": "File that defines the target."
+        }
+      }
+    },
+    "callClassification": {
+      "type": "string",
+      "enum": [
+        "resolved",
+        "ambiguous",
+        "python_builtin",
+        "dynamic_or_instance",
+        "external",
+        "unresolved_internal",
+        "unclassified"
+      ],
+      "description": "Why a call does or does not point at an in-repository definition.\n\nresolved: exactly one in-repository function, method, or class. targets has that definition.\n\nambiguous: more than one in-repository definition matches, for example two conditional functions with the same name. targets lists each candidate.\n\npython_builtin: the callee is a Python builtin, either called directly (len) or reached through a binding to a builtin.\n\nexternal: the callee is imported from a module outside the repository, including the standard library and third-party packages, or re-exported from one of those modules.\n\ndynamic_or_instance: the callee is an attribute of a value or instance (user.save, mapping.get) rather than a statically known definition. Also used for an unresolved dotted call that is not an import of an external or internal module.\n\nunresolved_internal: the name is bound, through an import, to a module or symbol inside the repository, but no concrete function, method, or class definition was found.\n\nunclassified: none of the rules above applied. Typically a bare name with no matching definition, builtin, or import."
+    }
+  }
+}

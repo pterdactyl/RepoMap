@@ -8,6 +8,12 @@ BUILTIN_NAMES = set(dir(builtins))
 
 IGNORED_DIRS = {".git", ".venv", "__pycache__", "node_modules"}
 
+# Shape, stable ids, and call classifications: schema/repository_map.schema.json.
+SCHEMA_VERSION = "1.0.0"
+SCHEMA_FILE = (
+    Path(__file__).resolve().parent.parent / "schema" / "repository_map.schema.json"
+)
+
 
 def _dotted_name(node):
     if isinstance(node, ast.Name):
@@ -1160,9 +1166,40 @@ def resolve_function_calls(results):
     return results
 
 
-def export_results(results, output_path):
-    with open(output_path, "w", encoding="utf-8") as file:
-        json.dump(results, file, indent=4)
+def repository_map_document(results, source=None):
+    document = {
+        "schema_version": SCHEMA_VERSION,
+        "files": results,
+    }
+    if source is not None:
+        document["source"] = source
+    return document
+
+
+def export_results(results, output_path, source=None):
+    output_path = Path(output_path)
+    document = repository_map_document(results, source=source)
+    with output_path.open("w", encoding="utf-8") as file:
+        json.dump(document, file, indent=4)
+    return document
+
+
+def unwrap_repository_map(data):
+    """Return the file records from a versioned map or a legacy JSON array."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("files"), list):
+        return data["files"]
+    raise ValueError(
+        "Unrecognized repository_map.json. Expected a list of files "
+        "or a document with a files array."
+    )
+
+
+def load_repository_map(path=Path("repository_map.json")):
+    with Path(path).open("r", encoding="utf-8") as file:
+        data = json.load(file)
+    return unwrap_repository_map(data)
 
 
 def _iter_resolved_calls(results):

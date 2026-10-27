@@ -2,10 +2,7 @@ import argparse
 import json
 from pathlib import Path
 
-
-def load_repository_map(path=Path("repository_map.json")):
-    with Path(path).open("r") as file:
-        return json.load(file)
+from .scanner import load_repository_map
 
 
 def build_function_index(results):
