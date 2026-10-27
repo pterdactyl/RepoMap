@@ -11,9 +11,11 @@ BUILTIN_NAMES = set(dir(builtins))
 
 IGNORED_DIRS = {".git", ".venv", "__pycache__", "node_modules"}
 
-# Shape, stable ids, call classifications, and inferred types:
+# Shape, stable ids, call classifications, inferred types, and entry points:
 # schema/repository_map.schema.json.
-SCHEMA_VERSION = "1.2.0"
+SCHEMA_VERSION = "1.3.0"
+_ENTRY_REASONS = ("main", "all", "reexport", "public")
+_TEST_DIR_NAMES = {"test", "tests", "testing"}
 SCHEMA_FILE = (
     Path(__file__).resolve().parent.parent / "schema" / "repository_map.schema.json"
 )
@@ -1239,6 +1241,254 @@ def _collect_module_imports(tree):
     return details
 
 
+def _is_public_name(name):
+    return bool(name) and not name.startswith("_")
+
+
+def _is_test_module(relative_path):
+    path = Path(relative_path)
+    if (
+        path.name == "conftest.py"
+        or path.name.startswith("test_")
+        or path.name.endswith("_test.py")
+    ):
+        return True
+    return any(part in _TEST_DIR_NAMES for part in path.parts[:-1])
+
+
+def _is_private_module(relative_path):
+    path = Path(relative_path)
+    parts = list(path.parts)
+    if path.name in {"__init__.py", "__main__.py"}:
+        parts = parts[:-1]
+    elif parts:
+        parts[-1] = path.stem
+    return any(part.startswith("_") for part in parts)
+
+
+def _skips_public_surface(relative_path):
+    return _is_test_module(relative_path) or _is_private_module(relative_path)
+
+
+def _statement_branches(node):
+    if isinstance(node, ast.If):
+        return [node.body, node.orelse]
+    if isinstance(node, ast.Try):
+        branches = [node.body, node.orelse, node.finalbody]
+        branches.extend(handler.body for handler in node.handlers)
+        return branches
+    try_star = getattr(ast, "TryStar", None)
+    if try_star is not None and isinstance(node, try_star):
+        branches = [node.body, node.orelse, node.finalbody]
+        branches.extend(handler.body for handler in node.handlers)
+        return branches
+    if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+        return [node.body, node.orelse]
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        return [node.body]
+    if isinstance(node, ast.Match):
+        return [case.body for case in node.cases]
+    return None
+
+
+def _static_string_list(node):
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _static_string_list(node.left)
+        right = _static_string_list(node.right)
+        if left is None or right is None:
+            return None
+        return left + right
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        names = []
+        for elt in node.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                names.append(elt.value)
+                continue
+            return None
+        return names
+    return None
+
+
+def _all_assignment(node):
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "__all__":
+                return node.value, False
+        return None
+    if (
+        isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "__all__"
+        and node.value is not None
+    ):
+        return node.value, False
+    if (
+        isinstance(node, ast.AugAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "__all__"
+    ):
+        return node.value, True
+    return None
+
+
+def _apply_exports(statements):
+    names = None
+    complete = True
+
+    def absorb(extra, extra_complete):
+        nonlocal names, complete
+        complete = complete and extra_complete
+        if extra is None:
+            return
+        if names is None:
+            names = []
+        for name in extra:
+            if name not in names:
+                names.append(name)
+
+    for statement in statements:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        found = _all_assignment(statement)
+        if found is not None:
+            value, extending = found
+            static = _static_string_list(value)
+            if static is None:
+                complete = False
+                continue
+            if extending:
+                if names is None:
+                    complete = False
+                absorb(static, True)
+            else:
+                names = list(dict.fromkeys(static))
+                complete = True
+            continue
+        branches = _statement_branches(statement)
+        if not branches:
+            continue
+        for branch in branches:
+            absorb(*_apply_exports(branch))
+    return names, complete
+
+
+def _module_exports(tree):
+    names, complete = _apply_exports(tree.body)
+    if names is None and complete:
+        return None
+    return {
+        "names": list(dict.fromkeys(names or [])),
+        "complete": bool(complete and names is not None),
+    }
+
+
+def _is_main_compare(test):
+    if not isinstance(test, ast.Compare):
+        return False
+    if len(test.ops) != 1 or not isinstance(test.ops[0], ast.Eq):
+        return False
+    if len(test.comparators) != 1:
+        return False
+    left = test.left
+    right = test.comparators[0]
+
+    def name_is_dunder(node):
+        return isinstance(node, ast.Name) and node.id == "__name__"
+
+    def string_is_main(node):
+        return isinstance(node, ast.Constant) and node.value == "__main__"
+
+    return (
+        name_is_dunder(left) and string_is_main(right)
+    ) or (
+        string_is_main(left) and name_is_dunder(right)
+    )
+
+
+def _is_main_guard(test):
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return any(_is_main_guard(value) for value in test.values)
+    return _is_main_compare(test)
+
+
+def _collect_calls(nodes):
+    calls = []
+
+    def visit(node):
+        if _nested_definition(node):
+            return
+        if isinstance(node, ast.Call):
+            expression = _call_expression(node)
+            if expression:
+                calls.append(expression)
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    for statement in nodes:
+        if _nested_definition(statement):
+            continue
+        visit(statement)
+    return sorted(set(calls))
+
+
+def _module_script_calls(statements):
+    calls = []
+    lines = []
+
+    def visit(node):
+        if _nested_definition(node):
+            return
+        if isinstance(node, ast.If) and _is_main_guard(node.test):
+            for child in node.orelse:
+                visit(child)
+            return
+        if isinstance(node, ast.Call):
+            expression = _call_expression(node)
+            if expression:
+                calls.append(expression)
+                lines.append(node.lineno)
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    for statement in statements:
+        visit(statement)
+    return sorted(set(calls)), (min(lines) if lines else None)
+
+
+def _main_blocks(tree, file_name):
+    blocks = []
+
+    def walk(statements):
+        for statement in statements:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(statement, ast.If) and _is_main_guard(statement.test):
+                blocks.append({
+                    "line": statement.lineno,
+                    "calls": _collect_calls(statement.body),
+                })
+                walk(statement.body)
+                walk(statement.orelse)
+                continue
+            branches = _statement_branches(statement)
+            if branches:
+                for branch in branches:
+                    walk(branch)
+
+    walk(tree.body)
+    if file_name == "__main__.py":
+        calls, call_line = _module_script_calls(tree.body)
+        if calls or not blocks:
+            if call_line is not None:
+                line = call_line
+            elif tree.body:
+                line = tree.body[0].lineno
+            else:
+                line = 1
+            blocks.insert(0, {"line": line, "calls": calls})
+    return blocks
+
+
 def analyze_file(file_path):
     source = file_path.read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -1326,6 +1576,8 @@ def analyze_file(file_path):
 
     analysis["types"] = module_inf.export_bindings()
     analysis["imports"] = list(dict.fromkeys(analysis["imports"]))
+    analysis["_exports"] = _module_exports(tree)
+    analysis["_main_blocks"] = _main_blocks(tree, file_path.name)
     return analysis
 
 
@@ -2165,12 +2417,299 @@ def link_type_ids(results):
     return results
 
 
+def _definition_catalog(results):
+    found = {}
+
+    def add(kind, name, line, file_path, stable_id):
+        if not stable_id:
+            return
+        found[stable_id] = {
+            "kind": kind,
+            "name": name,
+            "file": file_path,
+            "line": line,
+            "id": stable_id,
+            "reasons": [],
+        }
+
+    for result in results:
+        file_path = result["file"]
+        for function in result.get("functions") or []:
+            add("function", function["name"], function["line"], file_path, function["id"])
+        for cls in result.get("classes") or []:
+            add("class", cls["name"], cls["line"], file_path, cls["id"])
+            for method in cls.get("methods") or []:
+                add("method", method["name"], method["line"], file_path, method["id"])
+        for detail in result.get("function_details") or []:
+            for local in detail.get("local_definitions") or []:
+                add(local["kind"], local["name"], local["line"], file_path, local["id"])
+                for method in local.get("methods") or []:
+                    add("method", method["name"], method["line"], file_path, method["id"])
+    return found
+
+
+def _modules_by_name(results):
+    module_to_file = {}
+    file_to_result = {result["file"]: result for result in results}
+    for result in results:
+        _register_module(
+            module_to_file,
+            _module_from_file(result["file"]),
+            result["file"],
+        )
+    return {
+        module: file_to_result[file_path]
+        for module, file_path in module_to_file.items()
+        if file_path in file_to_result
+    }
+
+
+def _surface_candidates(result):
+    exports = result.get("_exports")
+    all_names = list(exports["names"]) if exports else []
+    restricted = bool(exports and exports["complete"])
+    if restricted:
+        return list(dict.fromkeys(all_names)), set(all_names), True
+
+    names = []
+    for function in result.get("functions") or []:
+        if _is_public_name(function["name"]):
+            names.append(function["name"])
+    for cls in result.get("classes") or []:
+        if _is_public_name(cls["name"]):
+            names.append(cls["name"])
+    for binding in result.get("bindings") or []:
+        if _is_public_name(binding["name"]):
+            names.append(binding["name"])
+    names.extend(all_names)
+    return list(dict.fromkeys(names)), set(all_names), False
+
+
+def _add_reason(definitions, stable_id, reason):
+    entry = definitions.get(stable_id)
+    if entry is None or not reason or reason in entry["reasons"]:
+        return
+    entry["reasons"].append(reason)
+
+
+def _annotate_name(definitions, index, module, name, source_file, all_names, restricted):
+    if not name or name == "*":
+        return
+    hit = index.lookup(module, name)
+    seen = set()
+    for target in hit.targets:
+        target_id = target.get("id")
+        if not target_id or target_id in seen:
+            continue
+        seen.add(target_id)
+        entry = definitions.get(target_id)
+        if entry is None:
+            continue
+        if name in all_names:
+            _add_reason(definitions, target_id, "all")
+        same_file = entry["file"] == source_file
+        if same_file and _is_public_name(name) and (not restricted or name in all_names):
+            _add_reason(definitions, target_id, "public")
+        if not same_file:
+            _add_reason(definitions, target_id, "reexport")
+
+
+def _star_exported_names(module, modules, seen):
+    if module is None or module in seen:
+        return []
+    seen.add(module)
+    result = modules.get(module)
+    if result is None:
+        return []
+
+    exports = result.get("_exports")
+    if exports and exports["complete"]:
+        return list(exports["names"])
+
+    names = []
+    for function in result.get("functions") or []:
+        if _is_public_name(function["name"]):
+            names.append(function["name"])
+    for cls in result.get("classes") or []:
+        if _is_public_name(cls["name"]):
+            names.append(cls["name"])
+    for binding in result.get("bindings") or []:
+        if _is_public_name(binding["name"]):
+            names.append(binding["name"])
+    for detail in result.get("import_details") or []:
+        if detail.get("type") != "from":
+            continue
+        origin = _absolute_module(
+            result["file"],
+            detail.get("module"),
+            detail.get("level") or 0,
+        )
+        for item in detail.get("names") or []:
+            if item["name"] == "*":
+                names.extend(_star_exported_names(origin, modules, seen))
+                continue
+            bound = item.get("alias") or item["name"]
+            if _is_public_name(bound):
+                names.append(bound)
+    return list(dict.fromkeys(names))
+
+
+def _annotate_init_imports(result, definitions, index, modules):
+    exports = result.get("_exports")
+    all_names = set(exports["names"]) if exports else set()
+    module = _module_from_file(result["file"])
+    names = []
+    star_origins = []
+    for detail in result.get("import_details") or []:
+        if detail.get("type") != "from":
+            continue
+        origin = _absolute_module(
+            result["file"],
+            detail.get("module"),
+            detail.get("level") or 0,
+        )
+        for item in detail.get("names") or []:
+            if item["name"] == "*":
+                star_origins.append(origin)
+                continue
+            bound = item.get("alias") or item["name"]
+            if _is_public_name(bound):
+                names.append(bound)
+
+    for name in dict.fromkeys(names):
+        _annotate_name(
+            definitions,
+            index,
+            module,
+            name,
+            result["file"],
+            all_names,
+            False,
+        )
+    for origin in star_origins:
+        for name in _star_exported_names(origin, modules, set()):
+            _annotate_name(
+                definitions,
+                index,
+                origin,
+                name,
+                result["file"],
+                all_names,
+                False,
+            )
+
+
+def _definition_entry(entry):
+    return {
+        "kind": entry["kind"],
+        "name": entry["name"],
+        "file": entry["file"],
+        "line": entry["line"],
+        "id": entry["id"],
+        "reasons": [reason for reason in _ENTRY_REASONS if reason in entry["reasons"]],
+    }
+
+
+def _module_call_detail():
+    return {
+        "id": None,
+        "parent_id": None,
+        "local_imports": [],
+        "local_definitions": [],
+        "class_name": None,
+    }
+
+
+def detect_entry_points(results):
+    """Record __main__ blocks and the public API on each file.
+
+    A definition is listed on the file that defines it. __main__ blocks are
+    listed on the file that contains them. An uncalled private helper is
+    not an entry point.
+    """
+    definitions = _definition_catalog(results)
+    index = ResolutionIndex(results)
+    modules = _modules_by_name(results)
+    known_ids = known_definition_ids(results)
+    details_by_file = defaultdict(dict)
+    for result in results:
+        for detail in result.get("function_details") or []:
+            details_by_file[result["file"]][detail["id"]] = detail
+
+    for result in results:
+        if _skips_public_surface(result["file"]):
+            continue
+        names, all_names, restricted = _surface_candidates(result)
+        module = _module_from_file(result["file"])
+        for name in names:
+            _annotate_name(
+                definitions,
+                index,
+                module,
+                name,
+                result["file"],
+                all_names,
+                restricted,
+            )
+
+    for result in results:
+        if not _is_package_init(result["file"]) or _skips_public_surface(result["file"]):
+            continue
+        exports = result.get("_exports")
+        if exports and exports["complete"]:
+            continue
+        _annotate_init_imports(result, definitions, index, modules)
+
+    mains = defaultdict(list)
+    module_detail = _module_call_detail()
+    for result in results:
+        details_by_id = details_by_file[result["file"]]
+        for block in result.get("_main_blocks") or []:
+            resolved = [
+                _resolved_call_record(
+                    call,
+                    result,
+                    module_detail,
+                    index,
+                    details_by_id,
+                    known_ids,
+                )
+                for call in block["calls"]
+            ]
+            for call in resolved:
+                for target in call["targets"]:
+                    _add_reason(definitions, target.get("id"), "main")
+            mains[result["file"]].append({
+                "kind": "main",
+                "name": "__main__",
+                "file": result["file"],
+                "line": block["line"],
+                "id": None,
+                "reasons": ["main"],
+                "calls": resolved,
+            })
+
+    for result in results:
+        entries = [
+            _definition_entry(entry)
+            for entry in definitions.values()
+            if entry["file"] == result["file"] and entry["reasons"]
+        ]
+        entries.extend(mains[result["file"]])
+        entries.sort(key=lambda item: (item["line"], item["name"], 0 if item["kind"] == "main" else 1))
+        result["entry_points"] = entries
+        result.pop("_exports", None)
+        result.pop("_main_blocks", None)
+    return results
+
+
 def build_repository_map(repo_path):
     results = analyze_repository(repo_path)
     results = assign_ids(results, repo_path)
     results = resolve_dependencies(results, repo_path)
     results = resolve_function_calls(results)
-    return link_type_ids(results)
+    results = link_type_ids(results)
+    return detect_entry_points(results)
 
 
 def known_definition_ids(results):
@@ -2191,6 +2730,32 @@ def known_definition_ids(results):
     return ids
 
 
+def _resolved_call_record(call, result, detail, index, details_by_id, known_ids):
+    call_name = call[:-2] if call.endswith("()") else call
+    if call_name.startswith("self.") or call_name.startswith("cls."):
+        hit = _resolve_self_call(call_name, result, detail, index)
+    else:
+        hit = _resolve_call(call_name, result, detail, index, details_by_id)
+
+    hit.targets = [
+        target for target in hit.targets if target.get("id") in known_ids
+    ]
+    hit.finalized()
+    if hit.targets:
+        classification = "ambiguous" if len(hit.targets) > 1 else "resolved"
+    else:
+        classification = _classify_unresolved_call(
+            call_name, hit, result, detail, index
+        )
+    return {
+        "name": call,
+        "targets": hit.targets,
+        "ambiguous": len(hit.targets) > 1,
+        "unresolved": len(hit.targets) == 0,
+        "classification": classification,
+    }
+
+
 def resolve_function_calls(results):
     index = ResolutionIndex(results)
     known_ids = known_definition_ids(results)
@@ -2203,39 +2768,17 @@ def resolve_function_calls(results):
     for result in results:
         details_by_id = details_by_file[result["file"]]
         for detail in result["function_details"]:
-            detail["resolved_calls"] = []
-
-            for call in detail["calls"]:
-                call_name = call[:-2] if call.endswith("()") else call
-
-                if call_name.startswith("self.") or call_name.startswith("cls."):
-                    hit = _resolve_self_call(call_name, result, detail, index)
-                else:
-                    hit = _resolve_call(
-                        call_name, result, detail, index, details_by_id
-                    )
-
-                hit.targets = [
-                    target for target in hit.targets if target.get("id") in known_ids
-                ]
-                hit.finalized()
-
-                if hit.targets:
-                    classification = (
-                        "ambiguous" if len(hit.targets) > 1 else "resolved"
-                    )
-                else:
-                    classification = _classify_unresolved_call(
-                        call_name, hit, result, detail, index
-                    )
-
-                detail["resolved_calls"].append({
-                    "name": call,
-                    "targets": hit.targets,
-                    "ambiguous": len(hit.targets) > 1,
-                    "unresolved": len(hit.targets) == 0,
-                    "classification": classification,
-                })
+            detail["resolved_calls"] = [
+                _resolved_call_record(
+                    call,
+                    result,
+                    detail,
+                    index,
+                    details_by_id,
+                    known_ids,
+                )
+                for call in detail["calls"]
+            ]
 
     return results
 

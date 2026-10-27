@@ -38,7 +38,27 @@ def _called_ids(index):
     return called
 
 
-def find_entry_points(index):
+def find_entry_points(index, results=None):
+    """Return function and method ids worth tracing.
+
+    Maps that record entry_points start from that public and script surface.
+    A private helper is not included just because nothing calls it. Older
+    maps, which have no entry_points field, still start from uncalled functions.
+    """
+    if results is not None and all("entry_points" in result for result in results):
+        found = []
+        seen = set()
+        for result in results:
+            for entry in result.get("entry_points") or []:
+                if entry.get("kind") not in {"function", "method"}:
+                    continue
+                entry_id = entry.get("id")
+                if not entry_id or entry_id not in index or entry_id in seen:
+                    continue
+                seen.add(entry_id)
+                found.append(entry_id)
+        return found
+
     called = _called_ids(index)
     entries = [
         node_id
@@ -52,9 +72,9 @@ def find_entry_points(index):
     return list(index)
 
 
-def resolve_start_ids(index, start=None):
+def resolve_start_ids(index, start=None, results=None):
     if start is None:
-        return find_entry_points(index)
+        return find_entry_points(index, results)
 
     if start in index:
         return [start]
@@ -203,7 +223,7 @@ def trace_function(start_id, index):
 
 def trace_workflows(results, start=None):
     index = build_function_index(results)
-    start_ids = resolve_start_ids(index, start)
+    start_ids = resolve_start_ids(index, start, results)
 
     traces = [trace_function(start_id, index) for start_id in start_ids]
 
@@ -263,7 +283,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--start",
-        help="Function name or ID to start from (default: uncalled entry points)",
+        help="Function name or ID to start from (default: detected entry points)",
     )
     args = parser.parse_args()
 

@@ -8,6 +8,7 @@ from .scanner import (
     SCHEMA_VERSION,
     analyze_repository,
     assign_ids,
+    detect_entry_points,
     export_results,
     link_type_ids,
     print_run_summary,
@@ -60,6 +61,7 @@ def _emit_map(repo_path, output_dir, source):
     results = resolve_dependencies(results, repo_path)
     results = resolve_function_calls(results)
     results = link_type_ids(results)
+    results = detect_entry_points(results)
     print_run_summary(results)
 
     output_dir = Path(output_dir)
