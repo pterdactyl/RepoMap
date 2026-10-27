@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "repository_map.schema.json",
   "title": "RepoMap repository_map.json",
-  "description": "Static map of a Python repository. New exports are versioned documents (schema_version 1.0.0). Maps written before that version are a JSON array of the same file records and remain valid for readers.\n\nPaths are repository-relative and use forward slashes. The src/ directory prefix is kept in paths and ids; it is stripped only when deriving a Python module name for import resolution.\n\nDirectories named .git, .venv, __pycache__, and node_modules are skipped. Files that fail to parse are omitted.\n\nStable ids identify a file, class, method, or function inside one map. They stay the same across runs when the relative path and definition name stay the same. A line number is appended only when a file has more than one top-level definition with that name, and is always included for definitions nested inside a function. Those line-qualified ids change if the definition moves to a different line.\n\nId grammar:\n- file:{path}\n- class:{path}:{name} or class:{path}:{name}:{line}\n- method:{path}:{class}:{name} or method:{path}:{class}:{name}:{line}\n- function:{path}:{name} or function:{path}:{name}:{line}\n\nNested classes and functions always use the line-qualified form. Nested methods use method:{path}:{class}:{name}:{line}.",
+  "description": "Static map of a Python repository. New exports are versioned documents (schema_version 1.1.0). A bare JSON array of file records is still accepted.\n\nVersion 1.1.0 stores a signature and a body on every function and method. The signature has parameters (kind, annotation, and default), type parameters, and the return annotation. The body lists statements in source order: control flow (if, for, while, try, and the with and match blocks that contain them), return, raise, assignments, and expression statements. Expressions keep literals and the operators, calls, and names around them. A nested function or class is only a marker in the enclosing body; its statements live on its own function detail. elif is an if statement in orelse.\n\nPaths are repository-relative and use forward slashes. The src/ directory prefix is kept in paths and ids; it is stripped only when deriving a Python module name for import resolution.\n\nDirectories named .git, .venv, __pycache__, and node_modules are skipped. Files that fail to parse are omitted.\n\nStable ids identify a file, class, method, or function inside one map. They stay the same across runs when the relative path and definition name stay the same. A line number is appended only when a file has more than one top-level definition with that name, and is always included for definitions nested inside a function. Those line-qualified ids change if the definition moves to a different line.\n\nId grammar:\n- file:{path}\n- class:{path}:{name} or class:{path}:{name}:{line}\n- method:{path}:{class}:{name} or method:{path}:{class}:{name}:{line}\n- function:{path}:{name} or function:{path}:{name}:{line}\n\nNested classes and functions always use the line-qualified form. Nested methods use method:{path}:{class}:{name}:{line}.",
   "oneOf": [
     {
       "$ref": "#/$defs/versionedMap"
@@ -18,8 +18,8 @@
       "required": ["schema_version", "files"],
       "properties": {
         "schema_version": {
-          "const": "1.0.0",
-          "description": "Document format version. 1.0.0 is the first versioned repository_map.json."
+          "const": "1.1.0",
+          "description": "Document format version. 1.1.0 adds a signature and a structured body on every function detail. 1.0.0 was the first versioned repository_map.json and did not include those fields."
         },
         "source": {
           "$ref": "#/$defs/source",
@@ -159,7 +159,7 @@
           "items": {
             "$ref": "#/$defs/functionDetail"
           },
-          "description": "Body-level detail for every scanned function and method, including functions and methods nested inside other functions."
+          "description": "Body-level detail for every scanned function and method, including functions and methods nested inside other functions. Each detail includes a signature and a structured body for later translation."
         },
         "dependencies": {
           "type": "array",
@@ -317,6 +317,8 @@
       "required": [
         "name",
         "line",
+        "signature",
+        "body",
         "calls",
         "local_imports",
         "local_definitions",
@@ -333,6 +335,17 @@
         "line": {
           "type": "integer",
           "minimum": 1
+        },
+        "signature": {
+          "$ref": "#/$defs/signature",
+          "description": "Parameters in source order, type parameters, and the return annotation. Defaults and annotations are expressions. async is true for async def. kind is positional_only, positional, vararg, keyword_only, or kwarg. A bare * is implied when a keyword_only parameter is present and vararg is absent. A / is implied when a positional_only parameter is followed by another parameter."
+        },
+        "body": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/statement"
+          },
+          "description": "Statements in source order. if, for, while, try, with, and match keep their nested statements. return, raise, assignments, and expression statements carry structured expressions, including literals. Nested function and class definitions are markers; the nested function's signature and body, and nested methods, are separate function details. @overload stubs are omitted. elif is an if statement in orelse. An import a, b statement is one entry per alias, matching import_details, with the statement line added."
         },
         "calls": {
           "type": "array",
@@ -575,6 +588,1282 @@
         "unclassified"
       ],
       "description": "Why a call does or does not point at an in-repository definition.\n\nresolved: exactly one in-repository function, method, or class. targets has that definition.\n\nambiguous: more than one in-repository definition matches, for example two conditional functions with the same name. targets lists each candidate.\n\npython_builtin: the callee is a Python builtin, either called directly (len) or reached through a binding to a builtin.\n\nexternal: the callee is imported from a module outside the repository, including the standard library and third-party packages, or re-exported from one of those modules.\n\ndynamic_or_instance: the callee is an attribute of a value or instance (user.save, mapping.get) rather than a statically known definition. Also used for an unresolved dotted call that is not an import of an external or internal module.\n\nunresolved_internal: the name is bound, through an import, to a module or symbol inside the repository, but no concrete function, method, or class definition was found.\n\nunclassified: none of the rules above applied. Typically a bare name with no matching definition, builtin, or import."
+    },
+    "sourceLine": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "1-based source line of a statement."
+    },
+    "nullableExpression": {
+      "description": "An expression, or null when this position is empty in the source.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/expression"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullablePattern": {
+      "description": "A match pattern, or null for a wildcard with no nested pattern.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/pattern"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The def or async def header, without decorators. Parameters follow source order. positional_only parameters come before the implicit /. keyword_only parameters come after * or a vararg.",
+      "required": ["async", "type_params", "parameters", "returns"],
+      "properties": {
+        "async": {
+          "type": "boolean",
+          "description": "True for async def."
+        },
+        "type_params": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/typeParam"
+          },
+          "description": "PEP 695 type parameters on the function. Empty when the function has none."
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/parameter"
+          }
+        },
+        "returns": {
+          "$ref": "#/$defs/nullableExpression",
+          "description": "Return annotation. Null when the function has none."
+        }
+      }
+    },
+    "parameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "annotation", "default"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Parameter name, without * or **."
+        },
+        "kind": {
+          "enum": ["positional_only", "positional", "vararg", "keyword_only", "kwarg"],
+          "description": "positional_only is before /. positional accepts positional or keyword arguments. vararg is *args. keyword_only is after * or *args. kwarg is **kwargs."
+        },
+        "annotation": {
+          "$ref": "#/$defs/nullableExpression"
+        },
+        "default": {
+          "$ref": "#/$defs/nullableExpression",
+          "description": "Default expression. Null when the parameter has no default. vararg and kwarg are always null."
+        }
+      }
+    },
+    "typeParam": {
+      "description": "A PEP 695 type parameter.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/typeVarParam"
+        },
+        {
+          "$ref": "#/$defs/typeVarTupleParam"
+        },
+        {
+          "$ref": "#/$defs/paramSpecParam"
+        },
+        {
+          "$ref": "#/$defs/typeParamUnknown"
+        }
+      ]
+    },
+    "typeVarParam": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name", "bound", "default"],
+      "properties": {
+        "kind": {
+          "const": "typevar"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bound": {
+          "$ref": "#/$defs/nullableExpression",
+          "description": "Bound expression after the colon. Null when the type variable has no bound."
+        },
+        "default": {
+          "$ref": "#/$defs/nullableExpression"
+        }
+      }
+    },
+    "typeVarTupleParam": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name", "default"],
+      "properties": {
+        "kind": {
+          "const": "typevartuple"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "default": {
+          "$ref": "#/$defs/nullableExpression"
+        }
+      }
+    },
+    "paramSpecParam": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name", "default"],
+      "properties": {
+        "kind": {
+          "const": "paramspec"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "default": {
+          "$ref": "#/$defs/nullableExpression"
+        }
+      }
+    },
+    "typeParamUnknown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name", "node", "source"],
+      "properties": {
+        "kind": {
+          "const": "unknown"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "node": {
+          "type": "string",
+          "minLength": 1,
+          "description": "AST node class name."
+        },
+        "source": {
+          "type": ["string", "null"],
+          "description": "Unparsed source of the type parameter, or null when it cannot be rendered."
+        }
+      }
+    },
+    "expression": {
+      "description": "A structured expression. Literals use type constant. A dict key of null is a ** unpacking. Calls keep arguments, unlike the calls list, which only stores the callee name.",
+      "oneOf": [
+        {"$ref": "#/$defs/exprConstant"},
+        {"$ref": "#/$defs/exprName"},
+        {"$ref": "#/$defs/exprAttribute"},
+        {"$ref": "#/$defs/exprSubscript"},
+        {"$ref": "#/$defs/exprSlice"},
+        {"$ref": "#/$defs/exprList"},
+        {"$ref": "#/$defs/exprTuple"},
+        {"$ref": "#/$defs/exprSet"},
+        {"$ref": "#/$defs/exprDict"},
+        {"$ref": "#/$defs/exprStarred"},
+        {"$ref": "#/$defs/exprUnary"},
+        {"$ref": "#/$defs/exprBinOp"},
+        {"$ref": "#/$defs/exprBoolOp"},
+        {"$ref": "#/$defs/exprCompare"},
+        {"$ref": "#/$defs/exprIfExp"},
+        {"$ref": "#/$defs/exprCall"},
+        {"$ref": "#/$defs/exprJoinedStr"},
+        {"$ref": "#/$defs/exprFormatted"},
+        {"$ref": "#/$defs/exprTemplateStr"},
+        {"$ref": "#/$defs/exprInterpolation"},
+        {"$ref": "#/$defs/exprNamed"},
+        {"$ref": "#/$defs/exprLambda"},
+        {"$ref": "#/$defs/exprAwait"},
+        {"$ref": "#/$defs/exprYield"},
+        {"$ref": "#/$defs/exprYieldFrom"},
+        {"$ref": "#/$defs/exprListComp"},
+        {"$ref": "#/$defs/exprSetComp"},
+        {"$ref": "#/$defs/exprGenExp"},
+        {"$ref": "#/$defs/exprDictComp"},
+        {"$ref": "#/$defs/exprUnknown"}
+      ]
+    },
+    "statement": {
+      "description": "One statement in a function body. Block statements contain nested statement lists. A function or class statement does not contain the nested body.",
+      "oneOf": [
+        {"$ref": "#/$defs/stmtIf"},
+        {"$ref": "#/$defs/stmtFor"},
+        {"$ref": "#/$defs/stmtWhile"},
+        {"$ref": "#/$defs/stmtTry"},
+        {"$ref": "#/$defs/stmtReturn"},
+        {"$ref": "#/$defs/stmtRaise"},
+        {"$ref": "#/$defs/stmtAssign"},
+        {"$ref": "#/$defs/stmtAnnAssign"},
+        {"$ref": "#/$defs/stmtAugAssign"},
+        {"$ref": "#/$defs/stmtExpr"},
+        {"$ref": "#/$defs/stmtPass"},
+        {"$ref": "#/$defs/stmtBreak"},
+        {"$ref": "#/$defs/stmtContinue"},
+        {"$ref": "#/$defs/stmtDelete"},
+        {"$ref": "#/$defs/stmtAssert"},
+        {"$ref": "#/$defs/stmtGlobal"},
+        {"$ref": "#/$defs/stmtNonlocal"},
+        {"$ref": "#/$defs/stmtImport"},
+        {"$ref": "#/$defs/stmtWith"},
+        {"$ref": "#/$defs/stmtMatch"},
+        {"$ref": "#/$defs/stmtFunction"},
+        {"$ref": "#/$defs/stmtClass"},
+        {"$ref": "#/$defs/stmtTypeAlias"},
+        {"$ref": "#/$defs/stmtUnknown"}
+      ]
+    },
+    "pattern": {
+      "description": "A match pattern. class here is a class pattern, not a class statement.",
+      "oneOf": [
+        {"$ref": "#/$defs/patternValue"},
+        {"$ref": "#/$defs/patternSingleton"},
+        {"$ref": "#/$defs/patternSequence"},
+        {"$ref": "#/$defs/patternStar"},
+        {"$ref": "#/$defs/patternMapping"},
+        {"$ref": "#/$defs/patternClass"},
+        {"$ref": "#/$defs/patternAs"},
+        {"$ref": "#/$defs/patternOr"},
+        {"$ref": "#/$defs/patternUnknown"}
+      ]
+    },
+    "exprConstant": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A literal. kind null, bool, int, float, and str store value as JSON. Non-finite floats use the strings nan, inf, and -inf. bytes is lowercase hex. complex stores real and imag the same way as a float value. ellipsis has no value. A negative number written as -1 is a unary expression whose operand is the positive literal, matching Python's AST.",
+      "required": ["type", "kind"],
+      "properties": {
+        "type": {
+          "const": "constant"
+        },
+        "kind": {
+          "enum": ["null", "bool", "int", "float", "complex", "str", "bytes", "ellipsis"]
+        },
+        "value": {
+          "type": ["null", "boolean", "number", "string"]
+        },
+        "real": {
+          "oneOf": [
+            {"type": "number"},
+            {"enum": ["nan", "inf", "-inf"]}
+          ]
+        },
+        "imag": {
+          "oneOf": [
+            {"type": "number"},
+            {"enum": ["nan", "inf", "-inf"]}
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": ["null", "bool", "int", "float", "str", "bytes"]
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["value"]
+          }
+        },
+        {
+          "if": {
+            "properties": {"kind": {"const": "null"}},
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {"value": {"type": "null"}}
+          }
+        },
+        {
+          "if": {
+            "properties": {"kind": {"const": "bool"}},
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {"value": {"type": "boolean"}}
+          }
+        },
+        {
+          "if": {
+            "properties": {"kind": {"const": "int"}},
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {"value": {"type": "integer"}}
+          }
+        },
+        {
+          "if": {
+            "properties": {"kind": {"const": "float"}},
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "oneOf": [
+                  {"type": "number"},
+                  {"enum": ["nan", "inf", "-inf"]}
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"kind": {"const": "str"}},
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {"value": {"type": "string"}}
+          }
+        },
+        {
+          "if": {
+            "properties": {"kind": {"const": "bytes"}},
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "string",
+                "pattern": "^[0-9a-f]*$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"kind": {"const": "complex"}},
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["real", "imag"]
+          }
+        }
+      ]
+    },
+    "exprName": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id"],
+      "properties": {
+        "type": {"const": "name"},
+        "id": {"type": "string", "minLength": 1}
+      }
+    },
+    "exprAttribute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value", "attr"],
+      "properties": {
+        "type": {"const": "attribute"},
+        "value": {"$ref": "#/$defs/expression"},
+        "attr": {"type": "string", "minLength": 1}
+      }
+    },
+    "exprSubscript": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value", "slice"],
+      "properties": {
+        "type": {"const": "subscript"},
+        "value": {"$ref": "#/$defs/expression"},
+        "slice": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "exprSlice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "lower", "upper", "step"],
+      "properties": {
+        "type": {"const": "slice"},
+        "lower": {"$ref": "#/$defs/nullableExpression"},
+        "upper": {"$ref": "#/$defs/nullableExpression"},
+        "step": {"$ref": "#/$defs/nullableExpression"}
+      }
+    },
+    "exprList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "elts"],
+      "properties": {
+        "type": {"const": "list"},
+        "elts": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/expression"}
+        }
+      }
+    },
+    "exprTuple": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "elts"],
+      "properties": {
+        "type": {"const": "tuple"},
+        "elts": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/expression"}
+        }
+      }
+    },
+    "exprSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "elts"],
+      "properties": {
+        "type": {"const": "set"},
+        "elts": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/expression"}
+        }
+      }
+    },
+    "exprDict": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "keys and values are parallel. A null key is ** unpacking of the matching value.",
+      "required": ["type", "keys", "values"],
+      "properties": {
+        "type": {"const": "dict"},
+        "keys": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/nullableExpression"}
+        },
+        "values": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/expression"}
+        }
+      }
+    },
+    "exprStarred": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value"],
+      "properties": {
+        "type": {"const": "starred"},
+        "value": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "exprUnary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "op", "operand"],
+      "properties": {
+        "type": {"const": "unary"},
+        "op": {"enum": ["not", "~", "+", "-"]},
+        "operand": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "exprBinOp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "op", "left", "right"],
+      "properties": {
+        "type": {"const": "binop"},
+        "op": {"enum": ["+", "-", "*", "/", "//", "%", "**", "<<", ">>", "|", "^", "&", "@"]},
+        "left": {"$ref": "#/$defs/expression"},
+        "right": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "exprBoolOp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "op", "values"],
+      "properties": {
+        "type": {"const": "boolop"},
+        "op": {"enum": ["and", "or"]},
+        "values": {
+          "type": "array",
+          "minItems": 2,
+          "items": {"$ref": "#/$defs/expression"}
+        }
+      }
+    },
+    "exprCompare": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "left", "ops", "comparators"],
+      "properties": {
+        "type": {"const": "compare"},
+        "left": {"$ref": "#/$defs/expression"},
+        "ops": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": ["==", "!=", "<", "<=", ">", ">=", "is", "is not", "in", "not in"]
+          }
+        },
+        "comparators": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/expression"}
+        }
+      }
+    },
+    "exprIfExp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "test", "body", "orelse"],
+      "properties": {
+        "type": {"const": "ifexp"},
+        "test": {"$ref": "#/$defs/expression"},
+        "body": {"$ref": "#/$defs/expression"},
+        "orelse": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "callKeyword": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["arg", "value"],
+      "properties": {
+        "arg": {
+          "type": ["string", "null"],
+          "description": "Keyword name. Null for ** unpacking."
+        },
+        "value": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "exprCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "func", "args", "keywords"],
+      "properties": {
+        "type": {"const": "call"},
+        "func": {"$ref": "#/$defs/expression"},
+        "args": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/expression"}
+        },
+        "keywords": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/callKeyword"}
+        }
+      }
+    },
+    "exprJoinedStr": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "An f-string. values are string constants and formatted expressions.",
+      "required": ["type", "values"],
+      "properties": {
+        "type": {"const": "joinedstr"},
+        "values": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/expression"}
+        }
+      }
+    },
+    "exprFormatted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value", "conversion", "format"],
+      "properties": {
+        "type": {"const": "formatted"},
+        "value": {"$ref": "#/$defs/expression"},
+        "conversion": {
+          "enum": ["a", "r", "s", null],
+          "description": "Conversion flag. Null when the expression has none."
+        },
+        "format": {
+          "$ref": "#/$defs/nullableExpression",
+          "description": "Format spec. Null when the expression has none."
+        }
+      }
+    },
+    "exprTemplateStr": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A t-string. values are string constants and interpolations.",
+      "required": ["type", "values"],
+      "properties": {
+        "type": {"const": "templatestr"},
+        "values": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/expression"}
+        }
+      }
+    },
+    "exprInterpolation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value", "conversion", "format"],
+      "properties": {
+        "type": {"const": "interpolation"},
+        "value": {"$ref": "#/$defs/expression"},
+        "conversion": {"enum": ["a", "r", "s", null]},
+        "format": {"$ref": "#/$defs/nullableExpression"}
+      }
+    },
+    "exprNamed": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "An assignment expression, name := value.",
+      "required": ["type", "target", "value"],
+      "properties": {
+        "type": {"const": "named"},
+        "target": {"$ref": "#/$defs/expression"},
+        "value": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "exprLambda": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "parameters", "body"],
+      "properties": {
+        "type": {"const": "lambda"},
+        "parameters": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/parameter"}
+        },
+        "body": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "exprAwait": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value"],
+      "properties": {
+        "type": {"const": "await"},
+        "value": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "exprYield": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value"],
+      "properties": {
+        "type": {"const": "yield"},
+        "value": {"$ref": "#/$defs/nullableExpression"}
+      }
+    },
+    "exprYieldFrom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value"],
+      "properties": {
+        "type": {"const": "yieldfrom"},
+        "value": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "comprehension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "iter", "ifs", "async"],
+      "properties": {
+        "target": {"$ref": "#/$defs/expression"},
+        "iter": {"$ref": "#/$defs/expression"},
+        "ifs": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/expression"}
+        },
+        "async": {
+          "type": "boolean",
+          "description": "True for an async for clause inside a comprehension."
+        }
+      }
+    },
+    "exprListComp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "elt", "generators"],
+      "properties": {
+        "type": {"const": "listcomp"},
+        "elt": {"$ref": "#/$defs/expression"},
+        "generators": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/comprehension"}
+        }
+      }
+    },
+    "exprSetComp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "elt", "generators"],
+      "properties": {
+        "type": {"const": "setcomp"},
+        "elt": {"$ref": "#/$defs/expression"},
+        "generators": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/comprehension"}
+        }
+      }
+    },
+    "exprGenExp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "elt", "generators"],
+      "properties": {
+        "type": {"const": "genexp"},
+        "elt": {"$ref": "#/$defs/expression"},
+        "generators": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/comprehension"}
+        }
+      }
+    },
+    "exprDictComp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "key", "value", "generators"],
+      "properties": {
+        "type": {"const": "dictcomp"},
+        "key": {"$ref": "#/$defs/expression"},
+        "value": {"$ref": "#/$defs/expression"},
+        "generators": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/comprehension"}
+        }
+      }
+    },
+    "exprUnknown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "node", "source"],
+      "properties": {
+        "type": {"const": "unknown"},
+        "node": {
+          "type": "string",
+          "minLength": 1,
+          "description": "AST node class name."
+        },
+        "source": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "stmtIf": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "An if statement. elif is another if in orelse.",
+      "required": ["type", "line", "test", "body", "orelse"],
+      "properties": {
+        "type": {"const": "if"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "test": {"$ref": "#/$defs/expression"},
+        "body": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/statement"}
+        },
+        "orelse": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/statement"}
+        }
+      }
+    },
+    "stmtFor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "async", "target", "iter", "body", "orelse"],
+      "properties": {
+        "type": {"const": "for"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "async": {"type": "boolean"},
+        "target": {"$ref": "#/$defs/expression"},
+        "iter": {"$ref": "#/$defs/expression"},
+        "body": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/statement"}
+        },
+        "orelse": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/statement"}
+        }
+      }
+    },
+    "stmtWhile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "test", "body", "orelse"],
+      "properties": {
+        "type": {"const": "while"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "test": {"$ref": "#/$defs/expression"},
+        "body": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/statement"}
+        },
+        "orelse": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/statement"}
+        }
+      }
+    },
+    "exceptHandler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exception", "name", "body"],
+      "properties": {
+        "exception": {
+          "$ref": "#/$defs/nullableExpression",
+          "description": "Exception type. Null for a bare except."
+        },
+        "name": {
+          "type": ["string", "null"],
+          "description": "Name bound by as. Null when the handler has no as clause."
+        },
+        "body": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/statement"}
+        }
+      }
+    },
+    "stmtTry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "star", "body", "handlers", "orelse", "finalbody"],
+      "properties": {
+        "type": {"const": "try"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "star": {
+          "type": "boolean",
+          "description": "True for except* groups."
+        },
+        "body": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/statement"}
+        },
+        "handlers": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/exceptHandler"}
+        },
+        "orelse": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/statement"}
+        },
+        "finalbody": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/statement"}
+        }
+      }
+    },
+    "stmtReturn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "value"],
+      "properties": {
+        "type": {"const": "return"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "value": {"$ref": "#/$defs/nullableExpression"}
+      }
+    },
+    "stmtRaise": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "exc", "cause"],
+      "properties": {
+        "type": {"const": "raise"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "exc": {
+          "$ref": "#/$defs/nullableExpression",
+          "description": "Raised exception. Null for a bare raise."
+        },
+        "cause": {
+          "$ref": "#/$defs/nullableExpression",
+          "description": "Expression after from. Null when the raise has no from clause."
+        }
+      }
+    },
+    "stmtAssign": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "targets", "value"],
+      "properties": {
+        "type": {"const": "assign"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/expression"},
+          "description": "Assignment targets from left to right. a = b = 1 has two targets."
+        },
+        "value": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "stmtAnnAssign": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "target", "annotation", "value"],
+      "properties": {
+        "type": {"const": "annassign"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "target": {"$ref": "#/$defs/expression"},
+        "annotation": {"$ref": "#/$defs/expression"},
+        "value": {
+          "$ref": "#/$defs/nullableExpression",
+          "description": "Assigned value. Null for an annotation without a value."
+        }
+      }
+    },
+    "stmtAugAssign": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "target", "op", "value"],
+      "properties": {
+        "type": {"const": "augassign"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "target": {"$ref": "#/$defs/expression"},
+        "op": {
+          "enum": ["+=", "-=", "*=", "/=", "//=", "%=", "**=", "<<=", ">>=", "|=", "^=", "&=", "@="]
+        },
+        "value": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "stmtExpr": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "An expression statement. A docstring is a string constant here.",
+      "required": ["type", "line", "value"],
+      "properties": {
+        "type": {"const": "expr"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "value": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "stmtPass": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line"],
+      "properties": {
+        "type": {"const": "pass"},
+        "line": {"$ref": "#/$defs/sourceLine"}
+      }
+    },
+    "stmtBreak": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line"],
+      "properties": {
+        "type": {"const": "break"},
+        "line": {"$ref": "#/$defs/sourceLine"}
+      }
+    },
+    "stmtContinue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line"],
+      "properties": {
+        "type": {"const": "continue"},
+        "line": {"$ref": "#/$defs/sourceLine"}
+      }
+    },
+    "stmtDelete": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "targets"],
+      "properties": {
+        "type": {"const": "delete"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/expression"}
+        }
+      }
+    },
+    "stmtAssert": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "test", "message"],
+      "properties": {
+        "type": {"const": "assert"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "test": {"$ref": "#/$defs/expression"},
+        "message": {"$ref": "#/$defs/nullableExpression"}
+      }
+    },
+    "stmtGlobal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "names"],
+      "properties": {
+        "type": {"const": "global"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "names": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "stmtNonlocal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "names"],
+      "properties": {
+        "type": {"const": "nonlocal"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "names": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "stmtImport": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "An import or from import inside the function. Fields match importDetail, plus the statement line. import a, b is split into one object per alias.",
+      "required": ["type", "line", "module", "level", "alias", "names"],
+      "properties": {
+        "type": {"enum": ["import", "from"]},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "module": {"type": ["string", "null"]},
+        "level": {"type": "integer", "minimum": 0},
+        "alias": {"type": ["string", "null"]},
+        "names": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/importedName"}
+        }
+      }
+    },
+    "withItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["context", "optional_vars"],
+      "properties": {
+        "context": {"$ref": "#/$defs/expression"},
+        "optional_vars": {
+          "$ref": "#/$defs/nullableExpression",
+          "description": "Target of as. Null when the item has no as clause."
+        }
+      }
+    },
+    "stmtWith": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "async", "items", "body"],
+      "properties": {
+        "type": {"const": "with"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "async": {"type": "boolean"},
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/withItem"}
+        },
+        "body": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/statement"}
+        }
+      }
+    },
+    "matchCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pattern", "guard", "body"],
+      "properties": {
+        "pattern": {"$ref": "#/$defs/pattern"},
+        "guard": {"$ref": "#/$defs/nullableExpression"},
+        "body": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/statement"}
+        }
+      }
+    },
+    "stmtMatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "subject", "cases"],
+      "properties": {
+        "type": {"const": "match"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "subject": {"$ref": "#/$defs/expression"},
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/matchCase"}
+        }
+      }
+    },
+    "stmtFunction": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A nested function marker. The function's signature and body are a separate function detail with the same name and line.",
+      "required": ["type", "line", "name", "async"],
+      "properties": {
+        "type": {"const": "function"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "name": {"type": "string", "minLength": 1},
+        "async": {"type": "boolean"}
+      }
+    },
+    "stmtClass": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A nested class marker. Methods are separate function details. bases lists dotted names; other base expressions are omitted.",
+      "required": ["type", "line", "name", "bases", "type_params"],
+      "properties": {
+        "type": {"const": "class"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "name": {"type": "string", "minLength": 1},
+        "bases": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "type_params": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/typeParam"}
+        }
+      }
+    },
+    "stmtTypeAlias": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "name", "type_params", "value"],
+      "properties": {
+        "type": {"const": "type_alias"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "name": {"type": "string", "minLength": 1},
+        "type_params": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/typeParam"}
+        },
+        "value": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "stmtUnknown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "line", "node", "source"],
+      "properties": {
+        "type": {"const": "unknown"},
+        "line": {"$ref": "#/$defs/sourceLine"},
+        "node": {"type": "string", "minLength": 1},
+        "source": {"type": ["string", "null"]}
+      }
+    },
+    "patternValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value"],
+      "properties": {
+        "type": {"const": "value"},
+        "value": {"$ref": "#/$defs/expression"}
+      }
+    },
+    "patternSingleton": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "value"],
+      "properties": {
+        "type": {"const": "singleton"},
+        "value": {"$ref": "#/$defs/exprConstant"}
+      }
+    },
+    "patternSequence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "patterns"],
+      "properties": {
+        "type": {"const": "sequence"},
+        "patterns": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/pattern"}
+        }
+      }
+    },
+    "patternStar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "name"],
+      "properties": {
+        "type": {"const": "star"},
+        "name": {"type": ["string", "null"]}
+      }
+    },
+    "patternMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "keys", "patterns", "rest"],
+      "properties": {
+        "type": {"const": "mapping"},
+        "keys": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/expression"}
+        },
+        "patterns": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/pattern"}
+        },
+        "rest": {"type": ["string", "null"]}
+      }
+    },
+    "patternClass": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "cls", "patterns", "kwd_attrs", "kwd_patterns"],
+      "properties": {
+        "type": {"const": "class"},
+        "cls": {"$ref": "#/$defs/expression"},
+        "patterns": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/pattern"}
+        },
+        "kwd_attrs": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "kwd_patterns": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/pattern"}
+        }
+      }
+    },
+    "patternAs": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A capture or wildcard. pattern and name are both null for _.",
+      "required": ["type", "pattern", "name"],
+      "properties": {
+        "type": {"const": "as"},
+        "pattern": {"$ref": "#/$defs/nullablePattern"},
+        "name": {"type": ["string", "null"]}
+      }
+    },
+    "patternOr": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "patterns"],
+      "properties": {
+        "type": {"const": "or"},
+        "patterns": {
+          "type": "array",
+          "minItems": 2,
+          "items": {"$ref": "#/$defs/pattern"}
+        }
+      }
+    },
+    "patternUnknown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "node", "source"],
+      "properties": {
+        "type": {"const": "unknown"},
+        "node": {"type": "string", "minLength": 1},
+        "source": {"type": ["string", "null"]}
+      }
     }
   }
 }

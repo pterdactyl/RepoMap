@@ -1,5 +1,6 @@
 import ast
 import json
+import math
 from collections import Counter, defaultdict
 from pathlib import Path
 import builtins
@@ -9,7 +10,7 @@ BUILTIN_NAMES = set(dir(builtins))
 IGNORED_DIRS = {".git", ".venv", "__pycache__", "node_modules"}
 
 # Shape, stable ids, and call classifications: schema/repository_map.schema.json.
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 SCHEMA_FILE = (
     Path(__file__).resolve().parent.parent / "schema" / "repository_map.schema.json"
 )
@@ -216,6 +217,874 @@ def _binding_from_value(value):
     return {"kind": "value", "source": None}
 
 
+# Bodies are JSON for later translation. Nested functions and classes are
+# markers; their statements are stored on their own function details.
+# Overload stubs are omitted, matching the rest of the map.
+
+_UNARY_OPS = {
+    ast.Not: "not",
+    ast.Invert: "~",
+    ast.UAdd: "+",
+    ast.USub: "-",
+}
+
+_BINARY_OPS = {
+    ast.Add: "+",
+    ast.Sub: "-",
+    ast.Mult: "*",
+    ast.Div: "/",
+    ast.FloorDiv: "//",
+    ast.Mod: "%",
+    ast.Pow: "**",
+    ast.LShift: "<<",
+    ast.RShift: ">>",
+    ast.BitOr: "|",
+    ast.BitXor: "^",
+    ast.BitAnd: "&",
+    ast.MatMult: "@",
+}
+
+_AUGMENTED_OPS = {op: symbol + "=" for op, symbol in _BINARY_OPS.items()}
+
+_COMPARE_OPS = {
+    ast.Eq: "==",
+    ast.NotEq: "!=",
+    ast.Lt: "<",
+    ast.LtE: "<=",
+    ast.Gt: ">",
+    ast.GtE: ">=",
+    ast.Is: "is",
+    ast.IsNot: "is not",
+    ast.In: "in",
+    ast.NotIn: "not in",
+}
+
+_BOOL_OPS = {
+    ast.And: "and",
+    ast.Or: "or",
+}
+
+_CONVERSIONS = {
+    -1: None,
+    97: "a",
+    114: "r",
+    115: "s",
+}
+
+
+def _source(node):
+    try:
+        return ast.unparse(node)
+    except (AttributeError, ValueError):
+        return None
+
+
+def _is_node(node, class_name):
+    cls = getattr(ast, class_name, None)
+    return cls is not None and isinstance(node, cls)
+
+
+def _json_number(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "nan"
+        return "inf" if value > 0 else "-inf"
+    return value
+
+
+def _constant_expr(value):
+    if value is None:
+        return {"type": "constant", "kind": "null", "value": None}
+    if isinstance(value, bool):
+        return {"type": "constant", "kind": "bool", "value": value}
+    if isinstance(value, int):
+        return {"type": "constant", "kind": "int", "value": value}
+    if isinstance(value, float):
+        return {"type": "constant", "kind": "float", "value": _json_number(value)}
+    if isinstance(value, str):
+        return {"type": "constant", "kind": "str", "value": value}
+    if isinstance(value, bytes):
+        return {"type": "constant", "kind": "bytes", "value": value.hex()}
+    if isinstance(value, complex):
+        return {
+            "type": "constant",
+            "kind": "complex",
+            "real": _json_number(value.real),
+            "imag": _json_number(value.imag),
+        }
+    if value is Ellipsis:
+        return {"type": "constant", "kind": "ellipsis"}
+    return {"type": "unknown", "node": "Constant", "source": repr(value)}
+
+
+def _conversion(value):
+    if value is None:
+        return None
+    return _CONVERSIONS.get(value)
+
+
+def _optional_expr(node):
+    if node is None:
+        return None
+    return _expression(node)
+
+
+def _expression(node):
+    handler = _EXPRESSION_HANDLERS.get(type(node))
+    if handler is None:
+        return {
+            "type": "unknown",
+            "node": type(node).__name__,
+            "source": _source(node),
+        }
+    return handler(node)
+
+
+def _expr_constant(node):
+    return _constant_expr(node.value)
+
+
+def _expr_name(node):
+    return {"type": "name", "id": node.id}
+
+
+def _expr_attribute(node):
+    return {
+        "type": "attribute",
+        "value": _expression(node.value),
+        "attr": node.attr,
+    }
+
+
+def _expr_subscript(node):
+    return {
+        "type": "subscript",
+        "value": _expression(node.value),
+        "slice": _expression(node.slice),
+    }
+
+
+def _expr_slice(node):
+    return {
+        "type": "slice",
+        "lower": _optional_expr(node.lower),
+        "upper": _optional_expr(node.upper),
+        "step": _optional_expr(node.step),
+    }
+
+
+def _expr_sequence(kind, node):
+    return {
+        "type": kind,
+        "elts": [_expression(elt) for elt in node.elts],
+    }
+
+
+def _expr_dict(node):
+    return {
+        "type": "dict",
+        "keys": [_optional_expr(key) for key in node.keys],
+        "values": [_expression(value) for value in node.values],
+    }
+
+
+def _expr_starred(node):
+    return {"type": "starred", "value": _expression(node.value)}
+
+
+def _expr_unary(node):
+    symbol = _UNARY_OPS.get(type(node.op))
+    if symbol is None:
+        return _unknown_expr(node)
+    return {
+        "type": "unary",
+        "op": symbol,
+        "operand": _expression(node.operand),
+    }
+
+
+def _expr_binop(node):
+    symbol = _BINARY_OPS.get(type(node.op))
+    if symbol is None:
+        return _unknown_expr(node)
+    return {
+        "type": "binop",
+        "op": symbol,
+        "left": _expression(node.left),
+        "right": _expression(node.right),
+    }
+
+
+def _expr_boolop(node):
+    symbol = _BOOL_OPS.get(type(node.op))
+    if symbol is None:
+        return _unknown_expr(node)
+    return {
+        "type": "boolop",
+        "op": symbol,
+        "values": [_expression(value) for value in node.values],
+    }
+
+
+def _expr_compare(node):
+    ops = []
+    for op in node.ops:
+        symbol = _COMPARE_OPS.get(type(op))
+        if symbol is None:
+            return _unknown_expr(node)
+        ops.append(symbol)
+    return {
+        "type": "compare",
+        "left": _expression(node.left),
+        "ops": ops,
+        "comparators": [_expression(item) for item in node.comparators],
+    }
+
+
+def _expr_ifexp(node):
+    return {
+        "type": "ifexp",
+        "test": _expression(node.test),
+        "body": _expression(node.body),
+        "orelse": _expression(node.orelse),
+    }
+
+
+def _expr_call(node):
+    return {
+        "type": "call",
+        "func": _expression(node.func),
+        "args": [_expression(arg) for arg in node.args],
+        "keywords": [
+            {"arg": keyword.arg, "value": _expression(keyword.value)}
+            for keyword in node.keywords
+        ],
+    }
+
+
+def _expr_joinedstr(node):
+    return {
+        "type": "joinedstr",
+        "values": [_expression(value) for value in node.values],
+    }
+
+
+def _expr_formatted(node):
+    return {
+        "type": "formatted",
+        "value": _expression(node.value),
+        "conversion": _conversion(node.conversion),
+        "format": _optional_expr(node.format_spec),
+    }
+
+
+def _expr_templatestr(node):
+    return {
+        "type": "templatestr",
+        "values": [_expression(value) for value in node.values],
+    }
+
+
+def _expr_interpolation(node):
+    return {
+        "type": "interpolation",
+        "value": _expression(node.value),
+        "conversion": _conversion(node.conversion),
+        "format": _optional_expr(node.format_spec),
+    }
+
+
+def _expr_named(node):
+    return {
+        "type": "named",
+        "target": _expression(node.target),
+        "value": _expression(node.value),
+    }
+
+
+def _expr_lambda(node):
+    return {
+        "type": "lambda",
+        "parameters": _parameters(node.args),
+        "body": _expression(node.body),
+    }
+
+
+def _expr_await(node):
+    return {"type": "await", "value": _expression(node.value)}
+
+
+def _expr_yield(node):
+    return {"type": "yield", "value": _optional_expr(node.value)}
+
+
+def _expr_yield_from(node):
+    return {"type": "yieldfrom", "value": _expression(node.value)}
+
+
+def _comprehension(node):
+    return {
+        "target": _expression(node.target),
+        "iter": _expression(node.iter),
+        "ifs": [_expression(test) for test in node.ifs],
+        "async": bool(node.is_async),
+    }
+
+
+def _expr_listcomp(node):
+    return {
+        "type": "listcomp",
+        "elt": _expression(node.elt),
+        "generators": [_comprehension(item) for item in node.generators],
+    }
+
+
+def _expr_setcomp(node):
+    return {
+        "type": "setcomp",
+        "elt": _expression(node.elt),
+        "generators": [_comprehension(item) for item in node.generators],
+    }
+
+
+def _expr_genexp(node):
+    return {
+        "type": "genexp",
+        "elt": _expression(node.elt),
+        "generators": [_comprehension(item) for item in node.generators],
+    }
+
+
+def _expr_dictcomp(node):
+    return {
+        "type": "dictcomp",
+        "key": _expression(node.key),
+        "value": _expression(node.value),
+        "generators": [_comprehension(item) for item in node.generators],
+    }
+
+
+def _unknown_expr(node):
+    return {
+        "type": "unknown",
+        "node": type(node).__name__,
+        "source": _source(node),
+    }
+
+
+def _arg_parameter(arg, kind, default):
+    return {
+        "name": arg.arg,
+        "kind": kind,
+        "annotation": _optional_expr(arg.annotation),
+        "default": _optional_expr(default),
+    }
+
+
+def _parameters(args):
+    parameters = []
+    positional = list(args.posonlyargs) + list(args.args)
+    padded = [None] * (len(positional) - len(args.defaults)) + list(args.defaults)
+
+    for arg, default in zip(args.posonlyargs, padded):
+        parameters.append(_arg_parameter(arg, "positional_only", default))
+    for arg, default in zip(args.args, padded[len(args.posonlyargs):]):
+        parameters.append(_arg_parameter(arg, "positional", default))
+    if args.vararg is not None:
+        parameters.append(_arg_parameter(args.vararg, "vararg", None))
+    for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+        parameters.append(_arg_parameter(arg, "keyword_only", default))
+    if args.kwarg is not None:
+        parameters.append(_arg_parameter(args.kwarg, "kwarg", None))
+    return parameters
+
+
+def _type_param(node):
+    if _is_node(node, "TypeVar"):
+        return {
+            "kind": "typevar",
+            "name": node.name,
+            "bound": _optional_expr(getattr(node, "bound", None)),
+            "default": _optional_expr(getattr(node, "default_value", None)),
+        }
+    if _is_node(node, "TypeVarTuple"):
+        return {
+            "kind": "typevartuple",
+            "name": node.name,
+            "default": _optional_expr(getattr(node, "default_value", None)),
+        }
+    if _is_node(node, "ParamSpec"):
+        return {
+            "kind": "paramspec",
+            "name": node.name,
+            "default": _optional_expr(getattr(node, "default_value", None)),
+        }
+    name = getattr(node, "name", None)
+    return {
+        "kind": "unknown",
+        "name": name if isinstance(name, str) and name else type(node).__name__,
+        "node": type(node).__name__,
+        "source": _source(node),
+    }
+
+
+def _type_params(node):
+    return [_type_param(param) for param in getattr(node, "type_params", None) or []]
+
+
+def _function_signature(node):
+    return {
+        "async": isinstance(node, ast.AsyncFunctionDef),
+        "type_params": _type_params(node),
+        "parameters": _parameters(node.args),
+        "returns": _optional_expr(node.returns),
+    }
+
+
+def _statements(nodes):
+    statements = []
+    for node in nodes:
+        extracted = _statement(node)
+        if extracted is None:
+            continue
+        if isinstance(extracted, list):
+            statements.extend(extracted)
+        else:
+            statements.append(extracted)
+    return statements
+
+
+def _statement(node):
+    handler = _STATEMENT_HANDLERS.get(type(node))
+    if handler is None:
+        return _unknown_stmt(node)
+    return handler(node)
+
+
+def _unknown_stmt(node):
+    return {
+        "type": "unknown",
+        "line": getattr(node, "lineno", 1) or 1,
+        "node": type(node).__name__,
+        "source": _source(node),
+    }
+
+
+def _stmt_if(node):
+    return {
+        "type": "if",
+        "line": node.lineno,
+        "test": _expression(node.test),
+        "body": _statements(node.body),
+        "orelse": _statements(node.orelse),
+    }
+
+
+def _for_statement(node, is_async):
+    return {
+        "type": "for",
+        "line": node.lineno,
+        "async": is_async,
+        "target": _expression(node.target),
+        "iter": _expression(node.iter),
+        "body": _statements(node.body),
+        "orelse": _statements(node.orelse),
+    }
+
+
+def _stmt_for(node):
+    return _for_statement(node, False)
+
+
+def _stmt_async_for(node):
+    return _for_statement(node, True)
+
+
+def _stmt_while(node):
+    return {
+        "type": "while",
+        "line": node.lineno,
+        "test": _expression(node.test),
+        "body": _statements(node.body),
+        "orelse": _statements(node.orelse),
+    }
+
+
+def _except_handler(node):
+    return {
+        "exception": _optional_expr(node.type),
+        "name": node.name,
+        "body": _statements(node.body),
+    }
+
+
+def _try_statement(node, star):
+    return {
+        "type": "try",
+        "line": node.lineno,
+        "star": star,
+        "body": _statements(node.body),
+        "handlers": [_except_handler(handler) for handler in node.handlers],
+        "orelse": _statements(node.orelse),
+        "finalbody": _statements(node.finalbody),
+    }
+
+
+def _stmt_try(node):
+    return _try_statement(node, False)
+
+
+def _stmt_try_star(node):
+    return _try_statement(node, True)
+
+
+def _stmt_return(node):
+    return {
+        "type": "return",
+        "line": node.lineno,
+        "value": _optional_expr(node.value),
+    }
+
+
+def _stmt_raise(node):
+    return {
+        "type": "raise",
+        "line": node.lineno,
+        "exc": _optional_expr(node.exc),
+        "cause": _optional_expr(node.cause),
+    }
+
+
+def _stmt_assign(node):
+    return {
+        "type": "assign",
+        "line": node.lineno,
+        "targets": [_expression(target) for target in node.targets],
+        "value": _expression(node.value),
+    }
+
+
+def _stmt_annassign(node):
+    return {
+        "type": "annassign",
+        "line": node.lineno,
+        "target": _expression(node.target),
+        "annotation": _expression(node.annotation),
+        "value": _optional_expr(node.value),
+    }
+
+
+def _stmt_augassign(node):
+    symbol = _AUGMENTED_OPS.get(type(node.op))
+    if symbol is None:
+        return _unknown_stmt(node)
+    return {
+        "type": "augassign",
+        "line": node.lineno,
+        "target": _expression(node.target),
+        "op": symbol,
+        "value": _expression(node.value),
+    }
+
+
+def _stmt_expr(node):
+    return {
+        "type": "expr",
+        "line": node.lineno,
+        "value": _expression(node.value),
+    }
+
+
+def _stmt_pass(node):
+    return {"type": "pass", "line": node.lineno}
+
+
+def _stmt_break(node):
+    return {"type": "break", "line": node.lineno}
+
+
+def _stmt_continue(node):
+    return {"type": "continue", "line": node.lineno}
+
+
+def _stmt_delete(node):
+    return {
+        "type": "delete",
+        "line": node.lineno,
+        "targets": [_expression(target) for target in node.targets],
+    }
+
+
+def _stmt_assert(node):
+    return {
+        "type": "assert",
+        "line": node.lineno,
+        "test": _expression(node.test),
+        "message": _optional_expr(node.msg),
+    }
+
+
+def _stmt_global(node):
+    return {"type": "global", "line": node.lineno, "names": list(node.names)}
+
+
+def _stmt_nonlocal(node):
+    return {"type": "nonlocal", "line": node.lineno, "names": list(node.names)}
+
+
+def _stmt_import(node):
+    statements = []
+    for detail in _import_detail(node):
+        statements.append({
+            "type": detail["type"],
+            "line": node.lineno,
+            "module": detail["module"],
+            "level": detail["level"],
+            "alias": detail["alias"],
+            "names": [dict(name) for name in detail["names"]],
+        })
+    return statements
+
+
+def _with_statement(node, is_async):
+    return {
+        "type": "with",
+        "line": node.lineno,
+        "async": is_async,
+        "items": [
+            {
+                "context": _expression(item.context_expr),
+                "optional_vars": _optional_expr(item.optional_vars),
+            }
+            for item in node.items
+        ],
+        "body": _statements(node.body),
+    }
+
+
+def _stmt_with(node):
+    return _with_statement(node, False)
+
+
+def _stmt_async_with(node):
+    return _with_statement(node, True)
+
+
+def _pattern(node):
+    handler = _PATTERN_HANDLERS.get(type(node))
+    if handler is None:
+        return {
+            "type": "unknown",
+            "node": type(node).__name__,
+            "source": _source(node),
+        }
+    return handler(node)
+
+
+def _pattern_value(node):
+    return {"type": "value", "value": _expression(node.value)}
+
+
+def _pattern_singleton(node):
+    return {"type": "singleton", "value": _constant_expr(node.value)}
+
+
+def _pattern_sequence(node):
+    return {
+        "type": "sequence",
+        "patterns": [_pattern(pattern) for pattern in node.patterns],
+    }
+
+
+def _pattern_star(node):
+    return {"type": "star", "name": node.name}
+
+
+def _pattern_mapping(node):
+    return {
+        "type": "mapping",
+        "keys": [_expression(key) for key in node.keys],
+        "patterns": [_pattern(pattern) for pattern in node.patterns],
+        "rest": node.rest,
+    }
+
+
+def _pattern_class(node):
+    return {
+        "type": "class",
+        "cls": _expression(node.cls),
+        "patterns": [_pattern(pattern) for pattern in node.patterns],
+        "kwd_attrs": list(node.kwd_attrs),
+        "kwd_patterns": [_pattern(pattern) for pattern in node.kwd_patterns],
+    }
+
+
+def _pattern_as(node):
+    return {
+        "type": "as",
+        "pattern": _pattern(node.pattern) if node.pattern is not None else None,
+        "name": node.name,
+    }
+
+
+def _pattern_or(node):
+    return {
+        "type": "or",
+        "patterns": [_pattern(pattern) for pattern in node.patterns],
+    }
+
+
+def _match_case(case):
+    return {
+        "pattern": _pattern(case.pattern),
+        "guard": _optional_expr(case.guard),
+        "body": _statements(case.body),
+    }
+
+
+def _stmt_match(node):
+    return {
+        "type": "match",
+        "line": node.lineno,
+        "subject": _expression(node.subject),
+        "cases": [_match_case(case) for case in node.cases],
+    }
+
+
+def _stmt_nested(node):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if _is_overload(node):
+            return None
+        return {
+            "type": "function",
+            "line": node.lineno,
+            "name": node.name,
+            "async": isinstance(node, ast.AsyncFunctionDef),
+        }
+    return {
+        "type": "class",
+        "line": node.lineno,
+        "name": node.name,
+        "bases": _base_names(node),
+        "type_params": _type_params(node),
+    }
+
+
+def _alias_name(node):
+    if isinstance(node.name, ast.Name):
+        return node.name.id
+    source = _source(node.name)
+    return source or type(node.name).__name__
+
+
+def _stmt_type_alias(node):
+    return {
+        "type": "type_alias",
+        "line": node.lineno,
+        "name": _alias_name(node),
+        "type_params": _type_params(node),
+        "value": _expression(node.value),
+    }
+
+
+def _function_body(node):
+    return _statements(node.body)
+
+
+_EXPRESSION_HANDLERS = {
+    ast.Constant: _expr_constant,
+    ast.Name: _expr_name,
+    ast.Attribute: _expr_attribute,
+    ast.Subscript: _expr_subscript,
+    ast.Slice: _expr_slice,
+    ast.List: lambda node: _expr_sequence("list", node),
+    ast.Tuple: lambda node: _expr_sequence("tuple", node),
+    ast.Set: lambda node: _expr_sequence("set", node),
+    ast.Dict: _expr_dict,
+    ast.Starred: _expr_starred,
+    ast.UnaryOp: _expr_unary,
+    ast.BinOp: _expr_binop,
+    ast.BoolOp: _expr_boolop,
+    ast.Compare: _expr_compare,
+    ast.IfExp: _expr_ifexp,
+    ast.Call: _expr_call,
+    ast.JoinedStr: _expr_joinedstr,
+    ast.FormattedValue: _expr_formatted,
+    ast.NamedExpr: _expr_named,
+    ast.Lambda: _expr_lambda,
+    ast.Await: _expr_await,
+    ast.Yield: _expr_yield,
+    ast.YieldFrom: _expr_yield_from,
+    ast.ListComp: _expr_listcomp,
+    ast.SetComp: _expr_setcomp,
+    ast.GeneratorExp: _expr_genexp,
+    ast.DictComp: _expr_dictcomp,
+}
+
+_template_str = getattr(ast, "TemplateStr", None)
+if _template_str is not None:
+    _EXPRESSION_HANDLERS[_template_str] = _expr_templatestr
+
+_interpolation = getattr(ast, "Interpolation", None)
+if _interpolation is not None:
+    _EXPRESSION_HANDLERS[_interpolation] = _expr_interpolation
+
+_STATEMENT_HANDLERS = {
+    ast.If: _stmt_if,
+    ast.For: _stmt_for,
+    ast.AsyncFor: _stmt_async_for,
+    ast.While: _stmt_while,
+    ast.Try: _stmt_try,
+    ast.Return: _stmt_return,
+    ast.Raise: _stmt_raise,
+    ast.Assign: _stmt_assign,
+    ast.AnnAssign: _stmt_annassign,
+    ast.AugAssign: _stmt_augassign,
+    ast.Expr: _stmt_expr,
+    ast.Pass: _stmt_pass,
+    ast.Break: _stmt_break,
+    ast.Continue: _stmt_continue,
+    ast.Delete: _stmt_delete,
+    ast.Assert: _stmt_assert,
+    ast.Global: _stmt_global,
+    ast.Nonlocal: _stmt_nonlocal,
+    ast.Import: _stmt_import,
+    ast.ImportFrom: _stmt_import,
+    ast.With: _stmt_with,
+    ast.AsyncWith: _stmt_async_with,
+    ast.FunctionDef: _stmt_nested,
+    ast.AsyncFunctionDef: _stmt_nested,
+    ast.ClassDef: _stmt_nested,
+}
+
+_try_star = getattr(ast, "TryStar", None)
+if _try_star is not None:
+    _STATEMENT_HANDLERS[_try_star] = _stmt_try_star
+
+_match_stmt = getattr(ast, "Match", None)
+if _match_stmt is not None:
+    _STATEMENT_HANDLERS[_match_stmt] = _stmt_match
+
+_type_alias_stmt = getattr(ast, "TypeAlias", None)
+if _type_alias_stmt is not None:
+    _STATEMENT_HANDLERS[_type_alias_stmt] = _stmt_type_alias
+
+_PATTERN_HANDLERS = {}
+for _pattern_name, _pattern_handler in (
+    ("MatchValue", _pattern_value),
+    ("MatchSingleton", _pattern_singleton),
+    ("MatchSequence", _pattern_sequence),
+    ("MatchStar", _pattern_star),
+    ("MatchMapping", _pattern_mapping),
+    ("MatchClass", _pattern_class),
+    ("MatchAs", _pattern_as),
+    ("MatchOr", _pattern_or),
+):
+    _pattern_cls = getattr(ast, _pattern_name, None)
+    if _pattern_cls is not None:
+        _PATTERN_HANDLERS[_pattern_cls] = _pattern_handler
+
+
 def _collect_calls_and_imports(fn_node):
     calls = []
     local_imports = []
@@ -270,6 +1139,8 @@ def _record_function(analysis, node, parent_key=None, class_name=None):
     analysis["function_details"].append({
         "name": node.name,
         "line": node.lineno,
+        "signature": _function_signature(node),
+        "body": _function_body(node),
         "calls": calls,
         "local_imports": local_imports,
         "local_definitions": _local_definitions(node),
