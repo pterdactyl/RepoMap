@@ -35,12 +35,6 @@ def visualize_repository(
         arrowsize="0.7",
     )
 
-    file_ids = {
-        result["file"]: result["id"]
-        for result in results
-    }
-
-    # Group files into directory clusters.
     directories = {}
 
     for result in results:
@@ -52,7 +46,6 @@ def visualize_repository(
 
         directories.setdefault(directory, []).append(result)
 
-    # Create one visual group per directory.
     for directory, files in directories.items():
         cluster_id = "cluster_" + str(
             abs(hash(directory))
@@ -109,24 +102,6 @@ def visualize_repository(
                     label=f"<{table}>",
                 )
 
-    # Connect files that import each other.
-    # for result in results:
-    #     source_id = result["id"]
-
-    #     for dependency in result.get("dependencies", []):
-    #         target_id = file_ids.get(dependency)
-
-    #         if target_id:
-    #             graph.edge(
-    #                 source_id,
-    #                 target_id,
-    #                 # label="imports",
-    #                 color="#2563eb",
-    #                 penwidth="2",
-    #                 fontcolor="#2563eb",
-    #             )
-
-    # Graphviz produces a standalone SVG diagram.
     output_file.parent.mkdir(parents=True, exist_ok=True)
     svg_path = output_file.with_suffix(".svg")
     graph.render(

@@ -11,7 +11,6 @@ from .scanner import (
     detect_entry_points,
     export_results,
     link_type_ids,
-    print_run_summary,
     resolve_dependencies,
     resolve_function_calls,
 )
@@ -62,7 +61,6 @@ def _emit_map(repo_path, output_dir, source):
     results = resolve_function_calls(results)
     results = link_type_ids(results)
     results = detect_entry_points(results)
-    print_run_summary(results)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
